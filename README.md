@@ -11,8 +11,8 @@ This project fills those gaps on top of the stock kernel (a few small patched dr
 - The control panel: `suite/control` (installed as `surface-control`), described in the "Surface Control" section.
 - Design of the whole suite: `docs/SUITE-DESIGN.md`. Reddit/announcement draft: `docs/REDDIT-POST.md`.
 
-**Planned:** a graphical installer (a window with the steps and an optional console pane for power users) to replace running the scripts by hand,
-and the kernel-update check shown inside Surface Control itself instead of only as a notification.
+**Planned:** the kernel-update check shown inside Surface Control itself instead of only as a notification.
+**Not yet tested end to end:** the installer window running steps 1 and 2 for real on a freshly installed system (the page flow, the verification and a failing step are tested with fake steps).
 
 ---
 
@@ -52,6 +52,19 @@ That comparison was a single informal one and should not be relied on. **Future 
 A newer libcamera lists `Ccm` in its IPU3 tuning file; when Fedora ships it, a matrix can be added to `tuning/ipu3/*.yaml`.
 
 ## Quick path on a clean install
+
+**Easiest: the installer window.** In a terminal on the Surface:
+
+```bash
+git clone https://github.com/ccccri/surface-go-kinoite.git ~/surface-go-kinoite
+~/surface-go-kinoite/install.sh
+```
+
+A wizard (PySide6, already on Kinoite) checks the device, asks for your password once, runs the steps below with a progress bar, tells you what to press on the blue
+MOK screen, reopens by itself after each restart and ends with the verification. "Show details" opens the console output for power users. It looks at the
+system to know where it is, so closing it is safe. The steps below are what it runs; you can still do them by hand.
+
+**By hand**
 
 Do this on the Surface, as your normal user, in a terminal (Konsole). The scripts expect the folder in your home directory:
 

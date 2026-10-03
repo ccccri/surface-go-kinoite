@@ -8,6 +8,7 @@ for t in test_pages test_backend test_valuefield test_nfc_window test_keyboard t
     echo "$out" | tail -1
     [ $rc = 0 ] || { fail=1; echo "$out" | grep -i "FAIL\|Traceback\|Error" | head -5; }
 done
+printf '%-18s ' wizard; QT_QPA_PLATFORM=offscreen python3 -u ../installer/tests/test_wizard.py 2>&1 | tail -1
 # every page opened in the real window for a few seconds: no warnings, no crash
 for pg in overview updates cameras input audio nfc stylus sensors; do
     python3 main.py --page $pg >/tmp/page_$pg.log 2>&1 & p=$!
