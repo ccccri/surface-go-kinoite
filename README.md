@@ -1,29 +1,36 @@
 # Surface Go on Linux: cameras, NFC and Surface Control
 
-A Surface Go (model 1824) on Fedora Kinoite with Secure Boot on and **no `rpm-ostree` layering**: working front and rear cameras with autofocus, NFC, volume buttons,
+A Surface Go 1st gen (model 1824, 8 GB RAM, NVMe SSD, Wi-Fi only) on Fedora Kinoite with Secure Boot on and **no `rpm-ostree` layering**: working front and rear cameras with autofocus, NFC, volume buttons,
 a control panel (**Surface Control**) and a watcher that notices kernel updates. Tested on one tablet only (see `CONTRIBUTING.md` to report other models).
+
+**Why this exists.** The [linux-surface](https://github.com/linux-surface/linux-surface) kernel is the usual answer for Surface devices, but for this tablet it did not
+seem to give more than the stock Fedora kernel in our tests, and it leaves the same gaps open: the rear camera, the NFC reader and the volume buttons.
+This project fills those gaps on top of the stock kernel (a few small patched drivers, a patched libcamera, some services) and adds a control panel.
 
 - Quick start: `scripts/01-upgrade-and-mok.sh`, reboot, `scripts/02-build-and-install.sh`, `scripts/03-verify.sh` (details below).
 - The control panel: `suite/control` (installed as `surface-control`), described in the "Surface Control" section.
 - Design of the whole suite: `docs/SUITE-DESIGN.md`. Reddit/announcement draft: `docs/REDDIT-POST.md`.
 
+**Planned:** a graphical installer (a window with the steps and an optional console pane for power users) to replace running the scripts by hand,
+and the kernel-update check shown inside Surface Control itself instead of only as a notification.
+
 ---
 
-# Surface Go (model 1824) on Fedora Kinoite: cameras + NFC
+# Surface Go 1st gen (model 1824, 8 GB RAM, NVMe SSD, Wi-Fi only) on Fedora Kinoite: cameras + NFC
 
-Worked out and verified on 2026-09-30 on a Surface Go 1824 running Fedora Kinoite 44 (kernel 7.2.7-200.fc44),
+Worked out and verified on 2026-09-30 on this Surface Go running Fedora Kinoite 44 (kernel 7.2.7-200.fc44),
 Secure Boot **enabled**. Everything below was done and tested on the real device.
 
 ## What you get
 
 | Part | Status |
 |---|---|
-| Front camera (OV5693) | Works, 30 fps. Fixed focus. With the tuning in `tuning/ipu3/` a backlit scene (window behind you) is exposed properly and colours are neutral (ceiling within ~5% of an iPhone photo). |
+| Front camera (OV5693) | Works, 30 fps. Fixed focus. With the tuning in `tuning/ipu3/` a backlit scene (window behind you) is exposed properly and colours are neutral by eye. A measured colour comparison with a phone is still to do (see "Colour limits"). |
 | Rear camera (OV8865) | Works after the kernel patch below, 30 fps at 720p, 15 fps at 1080p, with **autofocus**: libcamera's contrast AF runs by itself and settles after ~3 s, so wait a moment after opening the camera before taking a picture. |
 | IR camera (OV7251, Windows Hello) | Detected by the kernel, not exposed by libcamera. Not usable. |
 | NFC | Works, always on. Reads NDEF from Type 2 tags (NTAG / Ultralight) in ~15 ms; other cards/phones are reported by UID only. |
 
-NFC behaves like an iPhone: the reader polls all the time and, when a tag shows up, plays a sound and shows a
+NFC behaves like on a phone: the reader polls all the time and, when a tag shows up, plays a sound and shows a
 notification with what is on it. A link is opened only if you click **Open** in the notification.
 Two small services do this (both installed by step 2):
 
@@ -31,20 +38,23 @@ Two small services do this (both installed by step 2):
 - `nfc-notify` (systemd *user* service): receives events from the daemon on `/run/nfc-notify/events.sock`
   (group `wheel`) and shows the notification + sound. Stop it with `systemctl --user disable --now nfc-notify`.
 
-Battery: the RF field is pulsed continuously while it runs. The chip's polling period is set to 250 ms by a small
-patch to the `nxp-nci` core (`patches/nxp-nci-poll-period.patch`, parameter `poll_period_ms`); the NCI default is
-1000 ms, i.e. up to a second before a new tag is noticed. Measured: tag read 10-17 ms, delivery to the notifier 1 ms.
+Power use. For NFC to notice a tag by itself, the reader has to send out a short radio pulse over and over, even when nothing is near. The more
+often it does, the sooner a tag is noticed and the more battery it uses. The chip's default is one pulse per second; a small patch to the
+`nxp-nci` driver (`patches/nxp-nci-poll-period.patch`, parameter `poll_period_ms`) sets it to every 250 ms, so a tag is noticed within a quarter of a second.
+Measured: reading a tag takes 10-17 ms and the notification gets the result 1 ms later. The extra battery drain was **not measured**; if it matters to you,
+raise the value (or stop the service: `systemctl disable --now nfc-daemon`).
 
 Colour limits: libcamera 0.7.x has no colour-correction-matrix (`Ccm`) algorithm for the IPU3, so colours can only be balanced by
-the automatic white balance. Neutral surfaces come out neutral, saturated blues are somewhat more saturated than on a phone.
+the automatic white balance. Neutral surfaces come out neutral, saturated blues are somewhat more saturated than on the iPhone 15 Pro we compared against.
+That comparison was a single informal one and should not be relied on. **Future work:** tune the colours properly and publish side-by-side photos with a phone.
 A newer libcamera lists `Ccm` in its IPU3 tuning file; when Fedora ships it, a matrix can be added to `tuning/ipu3/*.yaml`.
 
 ## Quick path on a clean install
 
-Do this on the Surface, as your normal user, in a terminal. Copy this whole folder onto it first
-(for example `scp -r surface-go-kinoite surface:`).
+Do this on the Surface, as your normal user, in a terminal (Konsole). The scripts expect the folder in your home directory:
 
 ```bash
+git clone https://github.com/ccccri/surface-go-kinoite.git ~/surface-go-kinoite
 cd ~/surface-go-kinoite
 bash scripts/01-upgrade-and-mok.sh      # upgrade + create signing key, queue MOK enrollment
 systemctl reboot
@@ -52,7 +62,9 @@ systemctl reboot
 
 At boot a **blue MOK screen** appears, you have about 10 seconds to press a key:
 `Enroll MOK` -> `Continue` -> `Yes` -> password (`surface`, or whatever you set with `MOK_PASSWORD=`) -> `Reboot`.
-It needs the keyboard attached.
+It needs the keyboard attached. The MOK screen **always uses a US (QWERTY) keyboard layout**, whatever layout the system uses, so the default password `surface` is
+safe to type; if you choose your own with `MOK_PASSWORD=`, use only characters that are in the same place on a US keyboard
+(see the [linux-surface Secure Boot page](https://github.com/linux-surface/linux-surface/wiki/Secure-Boot)).
 
 ```bash
 cd ~/surface-go-kinoite
@@ -64,8 +76,10 @@ bash scripts/03-verify.sh               # all lines should say [ok]
 Test NFC: hold a tag on the back of the device and move it slowly (the antenna position is not marked):
 you should hear a sound and get a notification. Test cameras: install Kamoso or Snapshot from Discover.
 
-**After every kernel or libcamera update** re-run `scripts/02-build-and-install.sh` and reboot. The modules are built for
-one exact kernel. If you forget, nothing breaks: the modprobe rules fall back to the stock modules (rear
+**After a kernel update** the patched modules have to be rebuilt, because they are built for one exact kernel. You do not have to remember it: a small
+service (`kmods-check`) runs at every login, and when the running kernel has no matching build it shows a notification with a **Rebuild now** button
+(about 5 minutes, asks for your password, then offers a reboot). The same rebuild is on the Updates page of Surface Control. Re-run
+`scripts/02-build-and-install.sh` by hand only after a libcamera update. If a rebuild is missed, nothing breaks: the modprobe rules fall back to the stock modules (rear
 camera goes back to the green-stripe bug, NFC disappears).
 
 ## Why each piece is needed (root causes)
