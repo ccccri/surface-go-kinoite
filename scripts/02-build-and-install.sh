@@ -260,6 +260,18 @@ install -m 755 "$HERE/tools/camera-mode.sh" "$HOME/.local/bin/surface-camera-mod
 sed "s#@GUIDE@#$HERE#g" "$HERE/suite/control/surface-control" > "$HOME/.local/bin/surface-control"; chmod 755 "$HOME/.local/bin/surface-control"
 sed "s#@BIN@#$HOME/.local/bin/surface-control#g" "$HERE/suite/control/surface-control.desktop" > "$HOME/.local/share/applications/surface-control.desktop"
 
+say "Keyboard cover recovery (trackpad not picked up after boot, and a reset button in Surface Control)"
+sudo install -m 755 "$HERE/tools/folio-heal.sh" /usr/local/sbin/folio-heal.sh
+sudo install -m 755 "$HERE/tools/folio-reset.sh" /usr/local/sbin/folio-reset.sh
+sudo install -m 644 "$HERE/tools/folio-heal.service" /etc/systemd/system/folio-heal.service
+sudo install -m 644 "$HERE/tools/folio-reset.service" /etc/systemd/system/folio-reset.service
+sudo install -m 644 "$HERE/tools/99-folio-heal.rules" /etc/udev/rules.d/99-folio-heal.rules
+sudo install -m 644 "$HERE/tools/50-folio-reset.rules" /etc/polkit-1/rules.d/50-folio-reset.rules
+sudo restorecon /usr/local/sbin/folio-*.sh 2>/dev/null || true
+sudo systemctl daemon-reload
+sudo udevadm control --reload
+install -m 644 "$HERE/tools/folio-reset.desktop" "$HOME/.local/share/applications/folio-reset.desktop"
+
 say "Done"
 echo "REBOOT now (do not try rmmod/modprobe -r on ipu3_imgu, nxp_nci or nxp_nci_i2c: they hang and block shutdown)."
 echo "Then verify with: $HERE/scripts/03-verify.sh"

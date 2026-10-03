@@ -18,6 +18,7 @@ import os
 import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -30,6 +31,10 @@ REPOLL_RESTING_S = 0.3   # pause between polls while the same tag keeps resting 
 # if we close the socket and send RF_DEACTIVATE while the kernel still has a data exchange in flight, the controller
 # never answers it and the kernel waits NCI_RF_DEACTIVATE_TIMEOUT = 30 s with the whole NFC stack blocked.
 RAW_TIMEOUT_S = 3.3
+# Power saver profile: the reader is on for a short window, then off for a few seconds (about 8 times fewer radio pulses; a tag can take up to
+# ~4 s to be noticed). Any other profile polls continuously as before.
+SAVER_WINDOW_S = 0.6
+SAVER_SLEEP_S = 3.4
 
 AF_NFC, NFC_SOCKPROTO_RAW = 39, 0
 NLM_F_REQUEST, NLM_F_ACK, NLM_F_DUMP = 1, 4, 0x300
@@ -368,6 +373,23 @@ def wait_for_adapter():
         time.sleep(2)
 
 
+_profile = {"at": 0.0, "saver": False}
+
+
+def power_saver():
+    """True while the desktop power profile is "power-saver" (power-profiles-daemon or tuned-ppd, net.hadess.PowerProfiles). Cached for 1 s."""
+    now = time.monotonic()
+    if now - _profile["at"] > 1.0:
+        _profile["at"] = now
+        try:
+            out = subprocess.run(["busctl", "--system", "get-property", "net.hadess.PowerProfiles", "/net/hadess/PowerProfiles",
+                                  "net.hadess.PowerProfiles", "ActiveProfile"], capture_output=True, text=True, timeout=3).stdout
+            _profile["saver"] = "power-saver" in out
+        except (OSError, subprocess.SubprocessError):
+            _profile["saver"] = False
+    return _profile["saver"]
+
+
 def main():
     wait_for_adapter()
     nl = NfcNetlink()
@@ -402,7 +424,16 @@ def main():
             errors = 0
             polling, poll_started = True, time.monotonic()
 
-        if not nl.wait_targets(2.0):
+        saver = power_saver()
+        if not nl.wait_targets(SAVER_WINDOW_S if saver else 2.0):
+            if saver:                          # window over and no tag: switch the reader off for a while
+                nl.call(CMD["STOP_POLL"], DEV)
+                polling = False
+                if os.environ.get("NFC_DEBUG"):
+                    log("power saver: reader off for %.1f s" % SAVER_SLEEP_S)
+                end = time.monotonic() + SAVER_SLEEP_S
+                while time.monotonic() < end and power_saver():
+                    time.sleep(0.25)
             continue                           # nothing yet: poll is still running, wait again
 
         polling = False                        # the kernel stops polling once it reports targets

@@ -43,6 +43,8 @@ often it does, the sooner a tag is noticed and the more battery it uses. The chi
 `nxp-nci` driver (`patches/nxp-nci-poll-period.patch`, parameter `poll_period_ms`) sets it to every 250 ms, so a tag is noticed within a quarter of a second.
 Measured: reading a tag takes 10-17 ms and the notification gets the result 1 ms later. The extra battery drain was **not measured**; if it matters to you,
 raise the value (or stop the service: `systemctl disable --now nfc-daemon`).
+When the desktop power profile is **Power Saver**, `nfc-daemon` reads for 0.6 s and then switches the reader off for 3.4 s, about 8 times fewer radio pulses; a tag can then take up to
+~4 s to be noticed. Any other profile goes back to continuous polling by itself.
 
 Colour limits: libcamera 0.7.x has no colour-correction-matrix (`Ccm`) algorithm for the IPU3, so colours can only be balanced by
 the automatic white balance. Neutral surfaces come out neutral, saturated blues are somewhat more saturated than on the iPhone 15 Pro we compared against.
@@ -474,7 +476,7 @@ patches/nxp-nci-add-NXP3001.patch  ACPI id for the NFC controller
 patches/nxp-nci-poll-period.patch  polling period 250 ms (NCI TOTAL_DURATION) via post_setup
 patches/intel-hid-volume-hold.patch  device volume buttons: press/hold/release (hold keeps changing the volume)
 patches/hid-bpf/*.bpf.c          HID-BPF program hiding the digitizer's fake battery
-tools/folio-heal.sh + .service + 99-folio-heal.rules   attach-time check/recovery for the keyboard cover trackpad
+tools/folio-heal.sh + .service + 99-folio-heal.rules   attach-time check/recovery for the keyboard cover trackpad (installed by step 2)
 tuning/pipewire/*.conf           speaker gain scale and filtered microphone
 tools/make_focus_chart.py        generates samples/focus-chart-A4.{svg,pdf} (print at 100%)
 tools/nfc-daemon.py + .service   the always-on NFC reader (system service)
