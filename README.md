@@ -486,3 +486,7 @@ tools/nfc_latency.py             detection latency test straight against the ker
 The patched modules are built per kernel version. After `rpm-ostree` boots a new kernel the modprobe rules silently fall back to the stock modules: the rear
 camera then shows a green picture (stale sensor mode, wrong pixel rate; dmesg shows `ipu3-cio2: payload length is ..., received ...`). Fix: run
 `scripts/02-build-and-install.sh` again on the Surface and reboot. Seen on 7.2.7 -> 7.2.8; that kernel also moved an `#include` in `intel/hid.c`, which the script now handles.
+
+## License
+
+MIT (see `LICENSE`) for the scripts, Surface Control and the documentation. The patches in `patches/` keep the license of the project they modify (libcamera: LGPL-2.1+, Linux kernel: GPL-2.0).

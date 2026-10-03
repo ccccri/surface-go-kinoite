@@ -11,4 +11,4 @@ This started as one person's fix for one tablet (Surface Go 1824, Fedora Kinoite
 - **No layering:** the install must not use `rpm-ostree install`. Everything lives in `/var`, `/etc`, `~/.local` and the toolbox.
 - Keep user-visible text in English (US).
 
-License: not chosen yet (see the issue "Choose a license"); the libcamera patches follow libcamera's LGPL-2.1+, the kernel patches the kernel's GPL-2.0.
+License: MIT for the scripts, the Surface Control app and the documentation (see `LICENSE`). The files in `patches/` are derived from other projects and keep their licenses: the libcamera patches follow libcamera's LGPL-2.1+, the kernel patches the kernel's GPL-2.0.
