@@ -13,7 +13,6 @@ import sys
 from PySide6.QtCore import QObject, Property, QProcess, QProcessEnvironment, QUrl, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtQuickControls2 import QQuickStyle
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUIDE = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -255,7 +254,6 @@ class Bridge(QObject):
 
 
 def main():
-    QQuickStyle.setStyle("org.kde.desktop") if "org.kde.desktop" in QQuickStyle.availableStyles() else None
     app = QGuiApplication(sys.argv)
     app.setApplicationName("Surface Go installer")
     app.setDesktopFileName("surface-installer")
