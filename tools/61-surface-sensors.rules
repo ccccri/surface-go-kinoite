@@ -1,0 +1,2 @@
+# Lets the logged-in user raise the update rate of the accelerometer and gyroscope (default 10 Hz) while Surface Control shows the 3D view.
+ACTION=="add", SUBSYSTEM=="iio", ATTR{name}=="accel_3d|gyro_3d", RUN+="/bin/sh -c 'chmod 0664 /sys%p/in_*_sampling_frequency; chgrp wheel /sys%p/in_*_sampling_frequency'"

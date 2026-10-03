@@ -1,0 +1,100 @@
+--- a/src/ipa/ipu3/algorithms/awb.cpp	2026-10-01 11:43:31.217871196 +0200
++++ b/src/ipa/ipu3/algorithms/awb.cpp	2026-10-01 11:43:31.261328385 +0200
+@@ -13,6 +13,8 @@
+ 
+ #include <libcamera/control_ids.h>
+ 
++#include "libcamera/internal/value_node.h"
++
+ #include "libipa/colours.h"
+ 
+ /**
+@@ -198,6 +200,29 @@
+ Awb::~Awb() = default;
+ 
+ /**
++ * \copydoc libcamera::ipa::Algorithm::init
++ *
++ * The optional "ccms" list gives colour correction matrices (sensor RGB to linear sRGB, applied after the white
++ * balance gains) for a number of light sources. Each entry has a key "ct" and a 3x3 "ccm". The key is the position of
++ * the sensor white point of the light source on the illuminant locus, 1000 * ln(B/G / R/G) + 5000 (warm to cool),
++ * see tools/cpf_to_tuning.py. The matrix used for a frame is interpolated at the white point chosen by the AWB.
++ */
++int Awb::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	if (!tuningData.contains("ccms"))
++		return 0;
++
++	int ret = ccms_.readYaml(tuningData["ccms"], "ct", "ccm");
++	if (ret) {
++		LOG(IPU3Awb, Error) << "Failed to parse 'ccms' tuning data";
++		return ret;
++	}
++
++	hasCcms_ = true;
++	return 0;
++}
++
++/**
+  * \copydoc libcamera::ipa::Algorithm::configure
+  */
+ int Awb::configure(IPAContext &context,
+@@ -295,8 +320,24 @@
+ 
+ 	LOG(IPU3Awb, Debug) << "Color temperature estimated: " << asyncResults_.temperatureK;
+ 
+-	/* The CCM matrix may change when color temperature will be used */
+ 	params->acc_param.ccm = imguCssCcmDefault;
++	const auto &awbState = context.activeState.awb;
++	if (hasCcms_ && awbState.gains.red > 0 && awbState.gains.green > 0 && awbState.gains.blue > 0) {
++		/* White point of the scene: chromaticity R/G and B/G are the inverse of the gains (green = reference). */
++		const double rg = awbState.gains.green / awbState.gains.red;
++		const double bg = awbState.gains.green / awbState.gains.blue;
++		const long key = std::lround(1000.0 * std::log(bg / rg)) + 5000;
++		const Matrix<float, 3, 3> &m = ccms_.getInterpolated(static_cast<unsigned int>(std::max(0L, key)));
++
++		/* The ImgU takes signed fixed point values with 13 fractional bits (8192 = 1.0). */
++		auto q = [](float v) {
++			return static_cast<int16_t>(std::clamp<long>(std::lround(v * 8192.0f), -32768, 32767));
++		};
++		struct ipu3_uapi_ccm_mat_config &c = params->acc_param.ccm;
++		c.coeff_m11 = q(m[0][0]); c.coeff_m12 = q(m[0][1]); c.coeff_m13 = q(m[0][2]); c.coeff_o_r = 0;
++		c.coeff_m21 = q(m[1][0]); c.coeff_m22 = q(m[1][1]); c.coeff_m23 = q(m[1][2]); c.coeff_o_g = 0;
++		c.coeff_m31 = q(m[2][0]); c.coeff_m32 = q(m[2][1]); c.coeff_m33 = q(m[2][2]); c.coeff_o_b = 0;
++	}
+ 
+ 	params->use.acc_awb = 1;
+ 	params->use.acc_bnr = 1;
+--- a/src/ipa/ipu3/algorithms/awb.h	2026-10-01 11:43:31.217988528 +0200
++++ b/src/ipa/ipu3/algorithms/awb.h	2026-10-01 11:43:31.261410168 +0200
+@@ -13,7 +13,11 @@
+ 
+ #include <libcamera/geometry.h>
+ 
++#include "libcamera/internal/matrix.h"
+ #include "libcamera/internal/vector.h"
++#include "libcamera/internal/value_node.h"
++
++#include "libipa/interpolator.h"
+ 
+ #include "algorithm.h"
+ 
+@@ -40,6 +44,7 @@
+ 	Awb();
+ 	~Awb();
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+@@ -70,6 +75,10 @@
+ 	Accumulator awbStats_[kAwbStatsSizeX * kAwbStatsSizeY];
+ 	AwbStatus asyncResults_;
+ 
++	/* Colour correction matrices from the tuning file, keyed by the position of the white point on the illuminant locus. */
++	Interpolator<Matrix<float, 3, 3>> ccms_;
++	bool hasCcms_ = false;
++
+ 	uint32_t stride_;
+ 	uint32_t cellsPerZoneX_;
+ 	uint32_t cellsPerZoneY_;

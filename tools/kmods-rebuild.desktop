@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rebuild Surface Go drivers
+Comment=Rebuild the patched camera, NFC and volume drivers after a kernel update
+Icon=system-software-update
+Exec=konsole --hold -e @GUIDE@/scripts/02-build-and-install.sh
+Terminal=false
+Categories=System;Settings;

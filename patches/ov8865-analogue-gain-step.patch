@@ -1,0 +1,17 @@
+--- a/drivers/media/i2c/ov8865.c	2026-09-30 23:21:52.223913374 +0200
++++ b/drivers/media/i2c/ov8865.c	2026-09-30 23:21:52.239364231 +0200
+@@ -2484,7 +2484,13 @@
+ 
+ 	/* Gain */
+ 
+-	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2048, 128,
++	/*
++	 * Step 1, not 128: the V4L2 core rounds the requested value to the step, which limited the gain to whole
++	 * multiples of 1x (1x, 2x, 3x ...) while the sensor applies intermediate values smoothly (measured: luma
++	 * rises continuously with the gain code). The auto exposure asks for gains like 1.2x-1.7x, got 1x or 2x, and the
++	 * picture flashed between two brightness levels.
++	 */
++	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2048, 1,
+ 			  128);
+ 
+ 	/* White Balance */

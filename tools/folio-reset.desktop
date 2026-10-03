@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Reset keyboard cover
+Comment=Re-detect the keyboard and trackpad of the cover (like unplugging and re-attaching it)
+Icon=input-keyboard
+Exec=sh -c 'systemctl start folio-reset.service && notify-send -i input-keyboard "Keyboard cover" "Detected again" || notify-send -i dialog-error "Keyboard cover" "Reset failed (journalctl -t folio-reset)"'
+Terminal=false
+Categories=System;Settings;

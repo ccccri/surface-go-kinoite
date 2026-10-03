@@ -1,0 +1,16 @@
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp	2026-10-01 22:09:58.856238868 +0200
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp	2026-10-01 22:09:58.869410298 +0200
+@@ -192,6 +192,13 @@
+ 	if (orientation != requestedOrientation)
+ 		status = Adjusted;
+ 
++	/*
++	 * The OV8865 rear camera of the Surface Go delivers a mirrored picture (the V4L2 controls report no
++	 * rotation, which cannot describe a mirror): flip it horizontally in the sensor.
++	 */
++	if (data_->cio2_.sensor()->model() == "ov8865")
++		combinedTransform_ ^= Transform::HFlip;
++
+ 	/* Cap the number of entries to the available streams. */
+ 	if (config_.size() > kMaxStreams) {
+ 		config_.resize(kMaxStreams);

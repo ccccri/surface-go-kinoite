@@ -1,0 +1,117 @@
+--- a/drivers/platform/x86/intel/hid.c
++++ b/drivers/platform/x86/intel/hid.c
+@@ -17,6 +17,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/string_choices.h>
+ #include <linux/suspend.h>
++#include <linux/timer.h>
+ #include "../dual_accel_detect.h"
+ 
+ enum intel_hid_tablet_sw_mode {
+@@ -244,6 +245,8 @@
+ 	struct input_dev *array;
+ 	struct input_dev *switches;
+ 	bool wakeup_mode;
++	struct timer_list vol_timer;	/* safety net: see intel_hid_volume_event() */
++	unsigned int vol_key;		/* volume key currently held down, 0 if none */
+ };
+ 
+ #define HID_EVENT_FILTER_UUID	"eeec56b3-4442-408f-a792-4edd4d758054"
+@@ -567,6 +570,66 @@
+ 	}
+ }
+ 
++/*
++ * The 5 button array sends separate press (0xC4/0xC6) and release (0xC5/0xC7) notifications for the volume buttons,
++ * but the keymap ignores the release ones and reports every press as an instant tap (autorelease). Holding the button
++ * therefore never repeated. Report the real press and release instead, so that holding the button auto-repeats like on
++ * a keyboard. If the firmware ever fails to send the release, the timer releases the key so that it cannot stay
++ * stuck and ramp the volume to the maximum.
++ */
++#define INTEL_HID_VOLUME_RELEASE_TIMEOUT	(4 * HZ)
++
++static void intel_hid_vol_timeout(struct timer_list *t)
++{
++	struct intel_hid_priv *priv = timer_container_of(priv, t, vol_timer);
++	unsigned int key = xchg(&priv->vol_key, 0);
++
++	if (!key)
++		return;
++
++	pr_warn("intel-hid: volume key release event not received, releasing it\n");
++	input_report_key(priv->array, key, 0);
++	input_sync(priv->array);
++}
++
++static bool volume_hold = true;
++module_param(volume_hold, bool, 0644);
++MODULE_PARM_DESC(volume_hold, "Hold-to-repeat for the device volume buttons (0 = instant taps like the stock driver)");
++
++static bool intel_hid_volume_event(struct intel_hid_priv *priv, u32 event)
++{
++	unsigned int key, old;
++	bool press;
++
++	if (!volume_hold)
++		return false;
++
++	switch (event) {
++	case 0xc4: key = KEY_VOLUMEUP;   press = true;  break;
++	case 0xc5: key = KEY_VOLUMEUP;   press = false; break;
++	case 0xc6: key = KEY_VOLUMEDOWN; press = true;  break;
++	case 0xc7: key = KEY_VOLUMEDOWN; press = false; break;
++	default:
++		return false;
++	}
++
++	if (press) {
++		old = xchg(&priv->vol_key, key);
++		if (old && old != key)
++			input_report_key(priv->array, old, 0);
++		input_report_key(priv->array, key, 1);
++		input_sync(priv->array);
++		mod_timer(&priv->vol_timer, jiffies + INTEL_HID_VOLUME_RELEASE_TIMEOUT);
++	} else {
++		if (xchg(&priv->vol_key, 0) == key)
++			timer_delete(&priv->vol_timer);
++		input_report_key(priv->array, key, 0);
++		input_sync(priv->array);
++	}
++
++	return true;
++}
++
+ static void notify_handler(acpi_handle handle, u32 event, void *context)
+ {
+ 	struct platform_device *device = context;
+@@ -657,6 +720,9 @@
+ 
+ 	/* 0xC0 is for HID events, other values are for 5 button array */
+ 	if (event != 0xc0) {
++		if (priv->array && intel_hid_volume_event(priv, event))
++			return;
++
+ 		if (!priv->array ||
+ 		    !sparse_keymap_report_event(priv->array, event, 1, true))
+ 			dev_dbg(&device->dev, "unknown event 0x%x\n", event);
+@@ -732,6 +798,8 @@
+ 		return -ENOMEM;
+ 	dev_set_drvdata(&device->dev, priv);
+ 
++	timer_setup(&priv->vol_timer, intel_hid_vol_timeout, 0);
++
+ 	err = devm_mutex_init(&device->dev, &priv->mutex);
+ 	if (err)
+ 		return err;
+@@ -810,8 +878,11 @@
+ {
+ 	acpi_handle handle = ACPI_HANDLE(&device->dev);
+ 
++	struct intel_hid_priv *priv = dev_get_drvdata(&device->dev);
++
+ 	device_init_wakeup(&device->dev, false);
+ 	acpi_remove_notify_handler(handle, ACPI_DEVICE_NOTIFY, notify_handler);
++	timer_delete_sync(&priv->vol_timer);
+ 	intel_hid_set_enable(&device->dev, false);
+ 	intel_button_array_enable(&device->dev, false);
+ }

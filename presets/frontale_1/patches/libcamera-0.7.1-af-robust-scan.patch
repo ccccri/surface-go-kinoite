@@ -1,0 +1,656 @@
+--- a/src/ipa/ipu3/algorithms/af.cpp	2026-10-01 19:15:56.169622999 +0200
++++ b/src/ipa/ipu3/algorithms/af.cpp	2026-10-01 21:25:56.536852779 +0200
+@@ -48,6 +48,14 @@
+ static constexpr uint16_t kAfMaxGridBlockWidth = 6;
+ /** The maximum value of Log2 of the height of the grid cell. */
+ static constexpr uint16_t kAfMaxGridBlockHeight = 6;
++/*
++ * The grid covers about two thirds of the BDS output in each direction (the hardware minimum, 16 x 16 cells of
++ * 16 x 8 pixels = 256 x 128 pixels, only looked at a tiny patch of the image, so the result depended on whatever
++ * small detail happened to be exactly in the centre). It must never be larger than the image: a fixed 1024 x 768
++ * grid corrupted the statistics (and with them the auto exposure) for small streams such as 640 x 480.
++ */
++static constexpr uint32_t kAfGridCoverageNum = 2;
++static constexpr uint32_t kAfGridCoverageDen = 3;
+ /** The number of blocks in vertical axis per slice. */
+ static constexpr uint16_t kAfDefaultHeightPerSlice = 2;
+ 
+@@ -67,10 +75,48 @@
+ 
+ /* Minimum focus step for searching appropriate focus */
+ static constexpr uint32_t kCoarseSearchStep = 30;
+-static constexpr uint32_t kFineSearchStep = 1;
++static constexpr uint32_t kFineSearchStep = 3;
+ 
+-/* Max ratio of variance change, 0.0 < kMaxChange < 1.0 */
+-static constexpr double kMaxChange = 0.5;
++/*
++ * Half width of the fine scan window around the best coarse step. The coarse (Y1) statistic can peak a few
++ * tens of steps after the real sharpness maximum, so a window proportional to the focus step (5%) could
++ * miss the maximum (measured: coarse best 360, real maximum 320).
++ */
++static constexpr uint32_t kFineWindow = 36;
++
++/*
++ * Once the lens is parked, the sharpness of the next kRefFrames frames is averaged into a reference. The scene is
++ * considered changed (and the scan restarted) when the sharpness stays more than kRefChange away from the reference
++ * for kOffFrames frames in a row. The original code compared a single frame with the best value seen during the scan
++ * (changes below 50% were ignored, and that maximum can come from a transient), so a wrong focus could stay forever.
++ * If the parked lens is much less sharp than the scan maximum, the scan found a spurious peak: scan again, up to
++ * kMaxRetries times.
++ */
++static constexpr uint32_t kRefFrames = 8;
++static constexpr double kRefChange = 0.3;
++static constexpr uint32_t kOffFrames = 3;
++static constexpr double kRefMinRatio = 0.7;
++static constexpr uint32_t kMaxRetries = 2;
++
++/*
++ * When the scene changes, the lens does not go back to step 0 and sweep the whole range (the visible "homing"):
++ * a local hill climb starts from the current position. The sharpness is measured at the current position and one
++ * kLocalStep above and below it; the lens then keeps moving in the better direction, one kLocalStep per position
++ * (kLocalHold frames per position, the first kLocalSkip of them ignored while the lens settles), until the sharpness
++ * has fallen below kLocalDrop of the best value for two positions in a row. The fine scan then refines the result.
++ * If no peak is found within kLocalMaxPositions the full scan is used.
++ */
++static constexpr uint32_t kLocalStep = 48;
++static constexpr uint32_t kLocalHold = 4;
++static constexpr uint32_t kLocalSkip = 2;
++static constexpr double kLocalDrop = 0.85;
++static constexpr uint32_t kLocalMaxPositions = 40;
++static constexpr double kLocalFlat = 0.12;
++static constexpr int64_t kRefineStep = 12;
++static constexpr uint32_t kRefineCount = 3;
++static constexpr uint32_t kRefineRounds = 3;
++static constexpr uint32_t kRefineHold = 4;
++static constexpr double kLocalSkipProbe = 1.25;
+ 
+ /* The numbers of frame to be ignored, before performing focus scan. */
+ static constexpr uint32_t kIgnoreFrame = 10;
+@@ -78,6 +124,31 @@
+ /* Fine scan range 0 < kFineRange < 1 */
+ static constexpr double kFineRange = 0.05;
+ 
++/*
++ * The coarse scan only gives up when the variance has fallen below this fraction
++ * of the best value seen so far, twice in a row. In the out-of-focus part of the
++ * lens range the variance wobbles by 5-10% from frame to frame, which the original
++ * "stop at the first 10% drop" rule mistook for a peak: the autofocus then refined
++ * around a step near 0 and stayed blurry.
++ */
++static constexpr double kCoarseDropRatio = 0.5;
++static constexpr uint32_t kCoarseDropCount = 2;
++
++/*
++ * The fine scan stops as soon as the variance is this fraction below the best value seen. The original code
++ * compared with the previous sample, so a peak that decreases slowly (a few % per step) was never detected
++ * and the scan ran to the end of its window.
++ */
++static constexpr double kFineDropRatio = 0.9;
++
++/*
++ * The AF variance scales with the square of the image brightness, so it cannot be compared from one frame to
++ * the next while the auto exposure is still converging (start of the stream, scene change). The autofocus
++ * does nothing until exposure * gain has changed by less than kAeStableTolerance for kAeStableFrames frames.
++ */
++static constexpr double kAeStableTolerance = 0.05;
++static constexpr uint32_t kAeStableFrames = 6;
++
+ /* Settings for IPU3 AF filter */
+ static struct ipu3_uapi_af_filter_config afFilterConfigDefault = {
+ 	.y1_coeff_0 = { 0, 1, 3, 7 },
+@@ -106,7 +177,8 @@
+  */
+ Af::Af()
+ 	: focus_(0), bestFocus_(0), currentVariance_(0.0), previousVariance_(0.0),
+-	  coarseCompleted_(false), fineCompleted_(false)
++	  coarseCompleted_(false), fineCompleted_(false), coarseDrops_(0),
++	  aeTotal_(0.0), aeStableFrames_(0), refVariance_(0.0), refFrames_(0), offFrames_(0), retries_(0), rescan_(false), local_(false)
+ {
+ }
+ 
+@@ -119,10 +191,24 @@
+ int Af::configure(IPAContext &context, const IPAConfigInfo &configInfo)
+ {
+ 	struct ipu3_uapi_grid_config &grid = context.configuration.af.afGrid;
+-	grid.width = kAfMinGridWidth;
+-	grid.height = kAfMinGridHeight;
+-	grid.block_width_log2 = kAfMinGridBlockWidth;
+-	grid.block_height_log2 = kAfMinGridBlockHeight;
++	/* Pick the smallest cell size that gives at most the maximum number of cells for the wanted coverage. */
++	auto pickGrid = [](uint32_t target, uint8_t minCells, uint8_t maxCells, uint16_t minLog2,
++			   uint16_t maxLog2, uint8_t &cells, uint16_t &log2) {
++		log2 = minLog2;
++		while (log2 < maxLog2 && (target >> log2) > maxCells)
++			log2++;
++		cells = std::clamp<uint32_t>(target >> log2, minCells, maxCells);
++	};
++	uint8_t cells;
++	uint16_t log2;
++	pickGrid(configInfo.bdsOutputSize.width * kAfGridCoverageNum / kAfGridCoverageDen,
++		 kAfMinGridWidth, kAfMaxGridWidth, kAfMinGridBlockWidth, kAfMaxGridBlockWidth, cells, log2);
++	grid.width = cells;
++	grid.block_width_log2 = log2;
++	pickGrid(configInfo.bdsOutputSize.height * kAfGridCoverageNum / kAfGridCoverageDen,
++		 kAfMinGridHeight, kAfMaxGridHeight, kAfMinGridBlockHeight, kAfMaxGridBlockHeight, cells, log2);
++	grid.height = cells;
++	grid.block_height_log2 = log2;
+ 
+ 	/*
+ 	 * \todo - while this clamping code is effectively a no-op, it satisfies
+@@ -212,12 +298,18 @@
+ 	if (afScan(context, kCoarseSearchStep)) {
+ 		coarseCompleted_ = true;
+ 		context.activeState.af.maxVariance = 0;
+-		focus_ = context.activeState.af.focus -
+-			 (context.activeState.af.focus * kFineRange);
++		const uint32_t best = context.activeState.af.focus;
++		focus_ = best > kFineWindow ? best - kFineWindow : 0;
+ 		context.activeState.af.focus = focus_;
+ 		previousVariance_ = 0;
+-		maxStep_ = std::clamp(focus_ + static_cast<uint32_t>((focus_ * kFineRange)),
+-				      0U, kMaxFocusSteps);
++		maxStep_ = std::min(best + kFineWindow, kMaxFocusSteps);
++
++		/*
++		 * The lens has to move back from the end of the coarse scan (up to two coarse steps past the best
++		 * one) and needs several frames to settle: do not measure during that time (the first fine samples
++		 * would come from a moving lens and end the scan or trigger a new one).
++		 */
++		ignoreCounter_ = kIgnoreFrame; /* settle before the fine scan */
+ 	}
+ }
+ 
+@@ -242,6 +334,264 @@
+ }
+ 
+ /**
++ * \brief Start a local search from the current lens position
++ * \param[in] context The shared IPA context
++ */
++void Af::afRescan(IPAContext &context)
++{
++	context.activeState.af.maxVariance = 0;
++	refVariance_ = 0.0;
++	refFrames_ = 0;
++	offFrames_ = 0;
++	rescan_ = false;
++	previousVariance_ = 0.0;
++	coarseCompleted_ = false;
++	fineCompleted_ = false;
++	coarseDrops_ = 0;
++	maxStep_ = kMaxFocusSteps;
++	context.activeState.af.stable = false;
++
++	local_ = true;
++	localPhase_ = LocalBase;
++	localStart_ = context.activeState.af.focus;
++	localHold_ = 0;
++	localAcc_ = 0.0;
++	localN_ = 0;
++	localCount_ = 0;
++	localVarUp_ = 0.0;
++	localVarDown_ = 0.0;
++	localFocus_ = localStart_;
++	localSamples_.clear();
++	/* The lens is already parked: measure it for a full hold. */
++	ignoreCounter_ = 0;
++}
++
++/**
++ * \brief End the local search and hand over to the fine scan
++ */
++void Af::afLocalDone(IPAContext &context, uint32_t best)
++{
++	/*
++	 * The climb is over (the sharpness was sampled every kLocalStep, so the real peak can be up to half of it
++	 * away from the best sample): measure kRefineCount positions kRefineStep apart centred on it. If the best of
++	 * them is at an end of the range the peak is further out, so measure again around that end.
++	 */
++	double est = best;
++	double l = -1.0, c = -1.0, r = -1.0;
++	for (const auto &p : localSamples_) {
++		if (p.first == static_cast<int64_t>(best))
++			c = std::max(c, p.second);
++		else if (p.first == static_cast<int64_t>(best) - kLocalStep)
++			l = p.second;
++		else if (p.first == static_cast<int64_t>(best) + kLocalStep)
++			r = p.second;
++	}
++	if (l >= 0.0 && r >= 0.0 && l - 2.0 * c + r < 0.0)
++		est = best + std::clamp(0.5 * (l - r) / (l - 2.0 * c + r), -1.0, 1.0) * kLocalStep;
++	best = static_cast<uint32_t>(std::clamp(est, 0.0, static_cast<double>(kMaxFocusSteps)));
++
++	localPhase_ = LocalRefine;
++	localBestFocus_ = best;
++	localRefineRounds_ = 0;
++	localSamples_.clear();
++	localHold_ = 0;
++	localAcc_ = 0.0;
++	localN_ = 0;
++	localRefineStart_ = std::max<int64_t>(0, static_cast<int64_t>(best) - (kRefineCount / 2) * kRefineStep);
++	localFocus_ = localRefineStart_;
++	context.activeState.af.focus = localFocus_;
++	focus_ = localFocus_;
++}
++
++/**
++ * \brief Place the sharpness peak with a parabola through the refinement samples and park the lens there
++ */
++void Af::afLocalFinish(IPAContext &context, uint32_t peakStep, double peakVar)
++{
++	local_ = false;
++	coarseCompleted_ = true;
++	fineCompleted_ = true;
++	bestFocus_ = peakStep;
++	focus_ = bestFocus_;
++	context.activeState.af.focus = bestFocus_;
++	context.activeState.af.maxVariance = peakVar;
++	context.activeState.af.stable = true;
++	previousVariance_ = 0;
++	refVariance_ = 0.0;
++	refFrames_ = 0;
++	offFrames_ = 0;
++	ignoreCounter_ = kIgnoreFrame;
++	LOG(IPU3Af, Debug) << "Local search ends at step " << bestFocus_ << " (coarse peak " << localBestFocus_ << ")";
++}
++
++/**
++ * \brief Local hill climb around the current lens position, see kLocalStep
++ */
++void Af::afLocalScan(IPAContext &context)
++{
++	const uint32_t hold = localPhase_ == LocalRefine ? kRefineHold : kLocalHold;
++	if (++localHold_ <= hold) {
++		if (localHold_ > kLocalSkip) {
++			localAcc_ += currentVariance_;
++			localN_++;
++		}
++		if (localHold_ < hold)
++			return;
++	}
++
++	/* A lens position has been measured. */
++	const double v = localN_ ? localAcc_ / localN_ : 0.0;
++	localHold_ = 0;
++	localAcc_ = 0.0;
++	localN_ = 0;
++
++	auto move = [&](int64_t pos) {
++		localFocus_ = pos;
++		context.activeState.af.focus = pos;
++		focus_ = pos;
++	};
++	const int64_t start = localStart_;
++	const int64_t step = kLocalStep;
++	const int64_t top = kMaxFocusSteps;
++
++	localSamples_.emplace_back(localFocus_, v);
++
++	if (localPhase_ == LocalRefine) {
++		if (localSamples_.size() < kRefineCount) {
++			localFocus_ = std::min<int64_t>(localRefineStart_ + localSamples_.size() * kRefineStep, kMaxFocusSteps);
++			context.activeState.af.focus = localFocus_;
++			focus_ = localFocus_;
++			return;
++		}
++
++		size_t k = 0;
++		for (size_t i = 1; i < localSamples_.size(); i++)
++			if (localSamples_[i].second > localSamples_[k].second)
++				k = i;
++
++		if ((k == 0 || k + 1 == localSamples_.size()) && ++localRefineRounds_ < kRefineRounds &&
++		    localSamples_[k].first > 0 && localSamples_[k].first < kMaxFocusSteps) {
++			localRefineStart_ = std::max<int64_t>(0, localSamples_[k].first - (kRefineCount / 2) * kRefineStep);
++			localSamples_.clear();
++			localFocus_ = localRefineStart_;
++			context.activeState.af.focus = localFocus_;
++			focus_ = localFocus_;
++			return;
++		}
++
++		double peak = localSamples_[k].first;
++		if (k > 0 && k + 1 < localSamples_.size()) {
++			const double l = localSamples_[k - 1].second;
++			const double c = localSamples_[k].second;
++			const double r = localSamples_[k + 1].second;
++			const double denom = l - 2.0 * c + r;
++			if (denom < 0.0)
++				peak += std::clamp(0.5 * (l - r) / denom, -1.0, 1.0) * kRefineStep;
++		}
++		afLocalFinish(context,
++			      static_cast<uint32_t>(std::clamp(peak, 0.0, static_cast<double>(kMaxFocusSteps))),
++			      localSamples_[k].second);
++		return;
++	}
++
++	if (localPhase_ == LocalBase) {
++		localVarBase_ = v;
++		if (start + step <= top) {
++			localPhase_ = LocalUp;
++			move(start + step);
++		} else if (start >= step) {
++			localPhase_ = LocalDown;
++			move(start - step);
++		} else {
++			afLocalDone(context, start);
++		}
++		return;
++	}
++
++	if (localPhase_ == LocalUp) {
++		localVarUp_ = v;
++		if (localVarUp_ > localVarBase_ * kLocalSkipProbe) {
++			/* Clearly sharper one step up: no need to look downwards. */
++			localDir_ = 1;
++			localBestVar_ = localVarUp_;
++			localBestFocus_ = start + step;
++			localWorse_ = 0;
++			localCount_ = 0;
++			localPhase_ = LocalClimb;
++			if (start + 2 * step > top)
++				afLocalDone(context, localBestFocus_);
++			else
++				move(start + 2 * step);
++			return;
++		}
++		if (start >= step) {
++			localPhase_ = LocalDown;
++			move(start - step);
++			return;
++		}
++	} else if (localPhase_ == LocalDown) {
++		localVarDown_ = v;
++	} else {
++		localCount_++;
++		if (v > localBestVar_) {
++			localBestVar_ = v;
++			localBestFocus_ = localFocus_;
++			localWorse_ = 0;
++		} else if (v < localBestVar_ * kLocalDrop) {
++			localWorse_++;
++		} else {
++			localWorse_ = 0;
++		}
++
++		const int64_t next = localFocus_ + localDir_ * step;
++		if (localWorse_ >= 2 || next < 0 || next > top) {
++			afLocalDone(context, localBestFocus_);
++		} else if (localCount_ > kLocalMaxPositions) {
++			LOG(IPU3Af, Debug) << "Local search found no peak, full scan";
++			local_ = false;
++			ignoreCounter_ = 0;
++			afReset(context);
++		} else {
++			move(next);
++		}
++		return;
++	}
++
++	/*
++	 * Far from the peak the sharpness is flat (measured: the same value within a few % over 130 steps), so the
++	 * neighbours say nothing about where the peak is: both within kLocalFlat of the current value means that the
++	 * lens is on that plateau and only the full scan can find the peak.
++	 */
++	const double up = localVarUp_ > 0.0 ? localVarUp_ : localVarBase_;
++	const double down = localVarDown_ > 0.0 ? localVarDown_ : localVarBase_;
++	if (std::max(up, down) <= localVarBase_ * (1.0 + kLocalFlat) && std::min(up, down) >= localVarBase_ * (1.0 - kLocalFlat)) {
++		LOG(IPU3Af, Debug) << "Local search: flat sharpness around step " << start << ", full scan";
++		local_ = false;
++		ignoreCounter_ = 0;
++		afReset(context);
++		return;
++	}
++
++	/* The neighbours are measured (a missing one counts as 0): pick a direction. */
++	if (localVarBase_ >= localVarUp_ && localVarBase_ >= localVarDown_) {
++		afLocalDone(context, start);
++		return;
++	}
++
++	localDir_ = localVarUp_ >= localVarDown_ ? 1 : -1;
++	localBestVar_ = std::max(localVarUp_, localVarDown_);
++	localBestFocus_ = localDir_ > 0 ? start + step : start - step;
++	localWorse_ = 0;
++	localCount_ = 0;
++	localPhase_ = LocalClimb;
++	const int64_t next = start + localDir_ * 2 * step;
++	if (next < 0 || next > top)
++		afLocalDone(context, localBestFocus_);
++	else
++		move(next);
++}
++
++/**
+  * \brief AF reset
+  * \param[in] context The shared IPA context
+  *
+@@ -253,13 +603,20 @@
+ 		return;
+ 
+ 	context.activeState.af.maxVariance = 0;
++	refVariance_ = 0.0;
++	refFrames_ = 0;
++	offFrames_ = 0;
++	rescan_ = false;
+ 	context.activeState.af.focus = 0;
+ 	focus_ = 0;
+ 	context.activeState.af.stable = false;
++	local_ = false;
++	rescan_ = false;
+ 	ignoreCounter_ = kIgnoreFrame;
+ 	previousVariance_ = 0.0;
+ 	coarseCompleted_ = false;
+ 	fineCompleted_ = false;
++	coarseDrops_ = 0;
+ 	maxStep_ = kMaxFocusSteps;
+ }
+ 
+@@ -279,37 +636,34 @@
+ 	if (focus_ > maxStep_) {
+ 		/* If reach the max step, move lens to the position. */
+ 		context.activeState.af.focus = bestFocus_;
++		coarseDrops_ = 0;
+ 		return true;
+-	} else {
+-		/*
+-		 * Find the maximum of the variance by estimating its
+-		 * derivative. If the direction changes, it means we have
+-		 * passed a maximum one step before.
+-		 */
+-		if ((currentVariance_ - context.activeState.af.maxVariance) >=
+-		    -(context.activeState.af.maxVariance * 0.1)) {
+-			/*
+-			 * Positive and zero derivative:
+-			 * The variance is still increasing. The focus could be
+-			 * increased for the next comparison. Also, the max variance
+-			 * and previous focus value are updated.
+-			 */
+-			bestFocus_ = focus_;
+-			focus_ += min_step;
+-			context.activeState.af.focus = focus_;
+-			context.activeState.af.maxVariance = currentVariance_;
+-		} else {
+-			/*
+-			 * Negative derivative:
+-			 * The variance starts to decrease which means the maximum
+-			 * variance is found. Set focus step to previous good one
+-			 * then return immediately.
+-			 */
++	}
++
++	/*
++	 * Keep the global maximum of the variance and end the scan once the variance has fallen clearly below it:
++	 * to kCoarseDropRatio of the maximum twice in a row for the coarse scan, to kFineDropRatio for the fine one.
++	 */
++	const bool coarse = min_step == kCoarseSearchStep;
++	const double dropRatio = coarse ? kCoarseDropRatio : kFineDropRatio;
++	const uint32_t dropCount = coarse ? kCoarseDropCount : 1;
++
++	if (currentVariance_ > context.activeState.af.maxVariance) {
++		context.activeState.af.maxVariance = currentVariance_;
++		bestFocus_ = focus_;
++		coarseDrops_ = 0;
++	} else if (currentVariance_ < context.activeState.af.maxVariance * dropRatio) {
++		if (++coarseDrops_ >= dropCount) {
+ 			context.activeState.af.focus = bestFocus_;
++			coarseDrops_ = 0;
+ 			return true;
+ 		}
++	} else {
++		coarseDrops_ = 0;
+ 	}
+ 
++	focus_ += min_step;
++	context.activeState.af.focus = focus_;
+ 	previousVariance_ = currentVariance_;
+ 	LOG(IPU3Af, Debug) << " Previous step is "
+ 			   << bestFocus_
+@@ -385,19 +739,40 @@
+  */
+ bool Af::afIsOutOfFocus(IPAContext &context)
+ {
+-	const uint32_t diff_var = std::abs(currentVariance_ -
+-					   context.activeState.af.maxVariance);
+-	const double var_ratio = diff_var / context.activeState.af.maxVariance;
++	if (rescan_)
++		return true;
++
++	if (refFrames_ < kRefFrames) {
++		refVariance_ += currentVariance_ / kRefFrames;
++		if (++refFrames_ == kRefFrames &&
++		    refVariance_ < context.activeState.af.maxVariance * kRefMinRatio && retries_ < kMaxRetries) {
++			retries_++;
++			rescan_ = true;
++			LOG(IPU3Af, Debug) << "Parked sharpness " << refVariance_ << " far below the scan maximum "
++					   << context.activeState.af.maxVariance << ": scanning again";
++			return true;
++		}
++		return false;
++	}
++
++	const double ratio = std::abs(currentVariance_ - refVariance_) / refVariance_;
+ 
+ 	LOG(IPU3Af, Debug) << "Variance change rate: "
+-			   << var_ratio
++			   << ratio
+ 			   << " Current VCM step: "
+ 			   << context.activeState.af.focus;
+ 
+-	if (var_ratio > kMaxChange)
+-		return true;
+-	else
+-		return false;
++	if (ratio > kRefChange) {
++		if (++offFrames_ >= kOffFrames) {
++			retries_ = 0;
++			rescan_ = true;
++			return true;
++		}
++	} else {
++		offFrames_ = 0;
++	}
++
++	return false;
+ }
+ 
+ /**
+@@ -438,14 +813,33 @@
+ 	 * For coarse: y1 are used.
+ 	 * For fine: y2 results are used.
+ 	 */
+-	currentVariance_ = afEstimateVariance(y_items, !coarseCompleted_);
++	/*
++	 * Always use the Y1 statistic. Measured against the sharpness of the processed image, Y1 has a clear peak at the
++	 * focus position while Y2 (used by the original code for the fine scan) decreases monotonically with the lens
++	 * position and has no usable maximum, which made the fine scan run to the end of its window.
++	 */
++	currentVariance_ = afEstimateVariance(y_items, true);
++
++	const double aeTotal = static_cast<double>(context.activeState.agc.exposure) *
++			       context.activeState.agc.gain;
++	if (aeTotal_ > 0.0 && std::abs(aeTotal / aeTotal_ - 1.0) > kAeStableTolerance)
++		aeStableFrames_ = 0;
++	else
++		aeStableFrames_++;
++	aeTotal_ = aeTotal;
++	if (aeStableFrames_ < kAeStableFrames)
++		return;
+ 
+ 	if (!context.activeState.af.stable) {
+-		afCoarseScan(context);
+-		afFineScan(context);
++		if (local_) {
++			afLocalScan(context);
++		} else {
++			afCoarseScan(context);
++			afFineScan(context);
++		}
+ 	} else {
+ 		if (afIsOutOfFocus(context))
+-			afReset(context);
++			afRescan(context);
+ 		else
+ 			afIgnoreFrameReset();
+ 	}
+--- a/src/ipa/ipu3/algorithms/af.h	2026-10-01 19:15:56.169677769 +0200
++++ b/src/ipa/ipu3/algorithms/af.h	2026-10-01 21:25:57.007854856 +0200
+@@ -7,6 +7,9 @@
+ 
+ #pragma once
+ 
++#include <utility>
++#include <vector>
++
+ #include <linux/intel-ipu3.h>
+ 
+ #include <libcamera/base/utils.h>
+@@ -44,6 +47,10 @@
+ 	void afFineScan(IPAContext &context);
+ 	bool afScan(IPAContext &context, int min_step);
+ 	void afReset(IPAContext &context);
++	void afRescan(IPAContext &context);
++	void afLocalScan(IPAContext &context);
++	void afLocalDone(IPAContext &context, uint32_t best);
++	void afLocalFinish(IPAContext &context, uint32_t peakStep, double peakVar);
+ 	bool afNeedIgnoreFrame();
+ 	void afIgnoreFrameReset();
+ 	double afEstimateVariance(Span<const y_table_item_t> y_items, bool isY1);
+@@ -66,6 +73,36 @@
+ 	bool coarseCompleted_;
+ 	/* If the fine scan completes, it is set to true. */
+ 	bool fineCompleted_;
++	uint32_t coarseDrops_;
++	/* Exposure * gain of the previous frame, and how many frames in a row it has been stable. */
++	double aeTotal_;
++	uint32_t aeStableFrames_;
++	/* Reference sharpness of the parked lens, see afIsOutOfFocus(). */
++	double refVariance_;
++	uint32_t refFrames_;
++	uint32_t offFrames_;
++	uint32_t retries_;
++	bool rescan_;
++	/* Local hill climb (see afRescan()). */
++	enum LocalPhase { LocalBase, LocalUp, LocalDown, LocalClimb, LocalRefine };
++	bool local_;
++	LocalPhase localPhase_ = LocalBase;
++	int64_t localStart_ = 0;
++	int64_t localFocus_ = 0;
++	int localDir_ = 1;
++	uint32_t localHold_ = 0;
++	uint32_t localN_ = 0;
++	uint32_t localCount_ = 0;
++	uint32_t localWorse_ = 0;
++	uint32_t localRefineRounds_ = 0;
++	int64_t localRefineStart_ = 0;
++	double localAcc_ = 0.0;
++	double localVarBase_ = 0.0;
++	double localVarUp_ = 0.0;
++	double localVarDown_ = 0.0;
++	double localBestVar_ = 0.0;
++	int64_t localBestFocus_ = 0;
++	std::vector<std::pair<int64_t, double>> localSamples_;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */

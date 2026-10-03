@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Surface Control
+GenericName=Surface Go control panel
+Comment=Health of the Surface Linux fixes, camera settings and more
+Icon=computer-laptop
+Exec=@BIN@
+Terminal=false
+Categories=System;Settings;

@@ -1,0 +1,2 @@
+# Whenever the Surface keyboard cover (USB 045e:09b5) appears - at boot or when it is attached later - run the trackpad check.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="045e", ATTR{idProduct}=="09b5", TAG+="systemd", ENV{SYSTEMD_WANTS}+="folio-heal.service"

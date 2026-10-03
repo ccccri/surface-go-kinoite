@@ -1,0 +1,16 @@
+[Unit]
+Description=NFC tag reader daemon (kernel NFC, no neard)
+# the local nxp-nci driver is loaded by local-nxp-nci.service; the daemon also waits for /sys/class/nfc/nfc0
+After=local-nxp-nci.service local-fs.target
+
+[Service]
+ExecStart=/usr/bin/python3 /var/lib/nfc-daemon/nfc-daemon.py
+# runs the socket directory for the desktop notifier; recreated at every start
+RuntimeDirectory=nfc-notify
+RuntimeDirectoryMode=0755
+# neither a crash nor a driver hiccup should leave the reader dead
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

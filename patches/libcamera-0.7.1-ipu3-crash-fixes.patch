@@ -1,0 +1,64 @@
+--- a/src/libcamera/pipeline/ipu3/imgu.cpp
++++ b/src/libcamera/pipeline/ipu3/imgu.cpp
+@@ -108,6 +108,14 @@
+ void calculateBDSHeight(ImgUDevice::Pipe *pipe, const Size &iif, const Size &gdc,
+ 			unsigned int bdsWidth, float bdsSF)
+ {
++	/*
++	 * minIFHeight is unsigned: for a small iif.height the subtraction wraps around and std::clamp()
++	 * below gets lo > hi, which aborts when built with _GLIBCXX_ASSERTIONS (Fedora). Such an input
++	 * cannot produce a valid pipe configuration anyway, so skip it.
++	 */
++	if (iif.height < ImgUDevice::kIFMaxCropHeight)
++		return;
++
+ 	unsigned int minIFHeight = iif.height - ImgUDevice::kIFMaxCropHeight;
+ 	unsigned int minBDSHeight = gdc.height + ImgUDevice::kFilterHeight * 2;
+ 	unsigned int ifHeight;
+@@ -397,7 +405,7 @@
+ 	 * \todo Filter out all resolutions < IF_CROP_MAX.
+ 	 * See https://bugs.libcamera.org/show_bug.cgi?id=32
+ 	 */
+-	if (in.width < ImgUDevice::kIFMaxCropWidth || in.height < ImgUDevice::kIFMaxCropHeight) {
++	if (in.width <= ImgUDevice::kIFMaxCropWidth || in.height <= ImgUDevice::kIFMaxCropHeight) {
+ 		LOG(IPU3, Error) << "Input resolution " << in << " not supported";
+ 		return {};
+ 	}
+--- a/src/libcamera/pipeline/ipu3/frames.cpp
++++ b/src/libcamera/pipeline/ipu3/frames.cpp
+@@ -26,6 +26,10 @@
+ void IPU3Frames::init(const std::vector<std::unique_ptr<FrameBuffer>> &paramBuffers,
+ 		      const std::vector<std::unique_ptr<FrameBuffer>> &statBuffers)
+ {
++	/* Drop anything left from a previous run: those buffers no longer exist. */
++	availableParamBuffers_ = {};
++	availableStatBuffers_ = {};
++
+ 	for (const std::unique_ptr<FrameBuffer> &buffer : paramBuffers)
+ 		availableParamBuffers_.push(buffer.get());
+ 
+@@ -39,6 +43,13 @@
+ {
+ 	availableParamBuffers_ = {};
+ 	availableStatBuffers_ = {};
++
++	/*
++	 * The buffers are freed right after this. A late completion of a frame that was in flight at stop
++	 * time must not find its (stale) entry: remove() would push the freed buffers back into the
++	 * available queues, and create() would use them after the next start.
++	 */
++	frameInfo_.clear();
+ }
+ 
+ IPU3Frames::Info *IPU3Frames::create(Request *request)
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp
+@@ -704,6 +704,8 @@
+ {
+ 	IPU3CameraData *data = cameraData(camera);
+ 
++	data->frameInfos_.bufferAvailable.disconnect(
++		data, &IPU3CameraData::queuePendingRequests);
+ 	data->frameInfos_.clear();
+ 
+ 	std::vector<unsigned int> ids;

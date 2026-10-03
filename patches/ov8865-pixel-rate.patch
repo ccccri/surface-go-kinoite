@@ -1,0 +1,19 @@
+--- a/drivers/media/i2c/ov8865.c	2026-09-30 23:10:08.119857796 +0200
++++ b/drivers/media/i2c/ov8865.c	2026-09-30 23:10:08.174857798 +0200
+@@ -2289,6 +2289,16 @@
+ 	lanes_count = bus_mipi_csi2->num_data_lanes;
+ 	mipi_pixel_rate = mipi_clk_rate * 2 * lanes_count / bits_per_sample;
+ 
++	/*
++	 * The figure above is derived from the MIPI link, not from the clock that drives the sensor timing. Measured on
++	 * the Surface Go (frame rate against VBLANK) a line of the binned mode (hts 1923) lasts 26.7 us, i.e. the pixel
++	 * clock is 72 MHz, 4 times lower than what the MIPI rate suggests. Userspace (libcamera) derives line duration,
++	 * exposure time and frame duration from the pixel rate, so with the MIPI figure every time was 4 times too short:
++	 * the auto exposure thought it was exposing for 8.3 ms while the sensor integrated for the whole 33 ms frame.
++	 */
++	if (mode->hts == 1923)
++		mipi_pixel_rate /= 4;
++
+ 	__v4l2_ctrl_s_ctrl_int64(ctrls->pixel_rate, mipi_pixel_rate);
+ 
+ 	return 0;

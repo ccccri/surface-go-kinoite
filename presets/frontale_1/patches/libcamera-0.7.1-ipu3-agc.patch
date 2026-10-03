@@ -1,0 +1,64 @@
+--- a/src/ipa/ipu3/algorithms/agc.cpp	2026-09-30 23:21:19.537007064 +0200
++++ b/src/ipa/ipu3/algorithms/agc.cpp	2026-09-30 23:21:19.539672763 +0200
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cmath>
+ 
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/utils.h>
+@@ -30,6 +31,13 @@
+ 
+ namespace ipa::ipu3::algorithms {
+ 
++/*
++ * The statistics of the first frames of a stream are not usable (black frames, sensor settings not applied yet).
++ * Reacting to them made the auto exposure jump to maximum gain at once, and it then needed ~100 frames (3 s) to come
++ * back from a completely blown out image. Keep the initial exposure and gain for this many frames.
++ */
++static constexpr uint32_t kAgcSkipFrames = 8;
++
+ /**
+  * \class Agc
+  * \brief A mean-based auto-exposure algorithm
+@@ -202,11 +210,14 @@
+  * Identify the current image brightness, and use that to estimate the optimal
+  * new exposure and gain for the scene.
+  */
+-void Agc::process(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++void Agc::process(IPAContext &context, const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+ 		  const ipu3_uapi_stats_3a *stats,
+ 		  ControlList &metadata)
+ {
++	if (frame < kAgcSkipFrames)
++		return;
++
+ 	Histogram hist = parseStatistics(stats, context.configuration.grid.bdsGrid);
+ 	rGain_ = context.activeState.awb.gains.red;
+ 	gGain_ = context.activeState.awb.gains.blue;
+@@ -228,6 +239,23 @@
+ 			       context.activeState.agc.exposureMode, hist,
+ 			       effectiveExposureValue);
+ 
++	/*
++	 * Flicker avoidance: lamps on the 50 Hz mains flicker at 100 Hz. An exposure that is a whole number of
++	 * flicker periods integrates the same amount of light whatever the phase, anything else makes the brightness
++	 * beat against the frame rate (seen as flashing). Round the exposure time down to a multiple of the period when
++	 * it is at least one period long, and keep exposure * gain constant with the analogue gain.
++	 */
++	{
++		constexpr double kFlickerPeriod = 10000.0; /* us */
++		const double exposureUs = newExposureTime.get<std::micro>();
++		if (exposureUs >= kFlickerPeriod) {
++			const double quantized = std::floor(exposureUs / kFlickerPeriod) * kFlickerPeriod;
++			aGain = std::min(aGain * exposureUs / quantized,
++					 context.configuration.agc.maxAnalogueGain);
++			newExposureTime = quantized * 1.0us;
++		}
++	}
++
+ 	LOG(IPU3Agc, Debug)
+ 		<< "Divided up exposure time, analogue gain and digital gain are "
+ 		<< newExposureTime << ", " << aGain << " and " << dGain;

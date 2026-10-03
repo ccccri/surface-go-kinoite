@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-enumerate the keyboard cover if its trackpad was not picked up
+# Started by udev (tools/99-folio-heal.rules) each time the cover appears. The re-enumeration itself raises a new "add"
+# event, so the rate limit stops any loop if the trackpad never binds.
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/folio-heal.sh

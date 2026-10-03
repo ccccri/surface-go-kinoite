@@ -1,0 +1,40 @@
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -415,7 +415,17 @@
+ 				 * Rolling Bar".
+ 				 */
+ 			},
+-			.sensorDelays = { },
++			.sensorDelays = {
++				/*
++				 * Measured on a Surface Go (IPU3): with the libcamera defaults for
++				 * unknown sensors (exposure 2, gain 1) the AE oscillates, with 2 and 2
++				 * it is stable.
++				 */
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
+ 		} },
+ 		{ "ov64a40", {
+ 			.unitCellSize = { 1008, 1008 },
+@@ -473,7 +483,17 @@
+ 				 * 5: "Color squares with rolling bar"
+ 				 */
+ 			},
+-			.sensorDelays = { },
++			.sensorDelays = {
++				/*
++				 * Measured on a Surface Go (IPU3): with the libcamera defaults for
++				 * unknown sensors (exposure 2, gain 1) the AE oscillates, with 2 and 2
++				 * it is stable.
++				 */
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
+ 		} },
+ 		{ "ov9281", {
+ 			.unitCellSize = { 3000, 3000 },

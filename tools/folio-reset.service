@@ -1,0 +1,6 @@
+[Unit]
+Description=Re-enumerate the keyboard cover (manual reset)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/folio-reset.sh

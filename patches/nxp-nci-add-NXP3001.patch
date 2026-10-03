@@ -1,0 +1,10 @@
+--- a/drivers/nfc/nxp-nci/i2c.c
++++ b/drivers/nfc/nxp-nci/i2c.c
+@@ -365,6 +365,7 @@
+ 	{ "NXP1001" },
+ 	{ "NXP1002" },
+ 	{ "NXP7471" },
++	{ "NXP3001" },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, acpi_id);

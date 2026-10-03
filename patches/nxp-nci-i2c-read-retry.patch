@@ -1,0 +1,58 @@
+--- a/drivers/nfc/nxp-nci/i2c.c
++++ b/drivers/nfc/nxp-nci/i2c.c
+@@ -141,6 +141,23 @@
+ 	return r;
+ }
+ 
++/*
++ * The controller sometimes NACKs a read although it asserted IRQ (it went back to standby, or the data
++ * was not ready yet). Retry a few times instead of treating it as fatal.
++ */
++static int nxp_nci_i2c_recv_retry(struct i2c_client *client, u8 *buf, int len)
++{
++	int r, retry;
++
++	r = i2c_master_recv(client, buf, len);
++	for (retry = 0; r == -EREMOTEIO && retry < 3; retry++) {
++		usleep_range(2000, 4000);
++		r = i2c_master_recv(client, buf, len);
++	}
++
++	return r;
++}
++
+ static int nxp_nci_i2c_nci_read(struct nxp_nci_i2c_phy *phy,
+ 				struct sk_buff **skb)
+ {
+@@ -148,7 +165,7 @@
+ 	struct i2c_client *client = phy->i2c_dev;
+ 	int r;
+ 
+-	r = i2c_master_recv(client, (u8 *) &header, NCI_CTRL_HDR_SIZE);
++	r = nxp_nci_i2c_recv_retry(client, (u8 *) &header, NCI_CTRL_HDR_SIZE);
+ 	if (r < 0) {
+ 		goto nci_read_exit;
+ 	} else if (r != NCI_CTRL_HDR_SIZE) {
+@@ -168,7 +185,7 @@
+ 	if (!header.plen)
+ 		return 0;
+ 
+-	r = i2c_master_recv(client, skb_put(*skb, header.plen), header.plen);
++	r = nxp_nci_i2c_recv_retry(client, skb_put(*skb, header.plen), header.plen);
+ 	if (r < 0) {
+ 		goto nci_read_exit_free_skb;
+ 	} else if (r != header.plen) {
+@@ -217,6 +234,13 @@
+ 	switch (info->mode) {
+ 	case NXP_NCI_MODE_NCI:
+ 		r = nxp_nci_i2c_nci_read(phy, &skb);
++		/*
++		 * Still NACKed after the retries: drop this read but do NOT latch hard_fault. A latched fault makes
++		 * write() fail instantly and the IRQ handler ignore everything, so every NCI command then times out
++		 * (up to 30 s for RF_DEACTIVATE) until the adapter is power cycled.
++		 */
++		if (r == -EREMOTEIO)
++			r = -ENXIO;
+ 		break;
+ 	case NXP_NCI_MODE_FW:
+ 		r = nxp_nci_i2c_fw_read(phy, &skb);

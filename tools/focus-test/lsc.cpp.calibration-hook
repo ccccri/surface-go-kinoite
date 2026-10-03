@@ -1,0 +1,364 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * IPU3 lens shading correction (Bayer shading block of the ImgU), from a calibration table of the camera module
+ */
+
+#include "lsc.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
+#include <libcamera/base/log.h>
+
+#include <libcamera/ipa/core_ipa_interface.h>
+
+namespace libcamera {
+
+namespace ipa::ipu3::algorithms {
+
+LOG_DEFINE_CATEGORY(IPU3Lsc)
+
+/**
+ * \class Lsc
+ * \brief Lens shading (vignetting and colour shading) correction
+ *
+ * The lens and the sensor microlenses make the picture darker and tinted towards the edges (for the Surface Go
+ * cameras up to 3.7x darker in blue in the corners, magenta centre and green edges on white). The camera module was
+ * calibrated for the Windows driver: for several light sources, a table with the gain of each Bayer channel
+ * (R, Gr, Gb, B) on a grid of cells of the pixel array, 1.0 in the middle. The ImgU can apply such gains in hardware
+ * from a table of up to 73 x 56 cells expressed in its own pixels (after the Bayer downscaler), so the calibration
+ * table is resampled to the ImgU grid at configuration time, following the crop, binning and scaling between the
+ * pixel array and the ImgU, and the tables of the two nearest light sources are blended for every frame.
+ *
+ * Tuning data:
+ *   cell: size in sensor array pixels of the cells of the calibration table
+ *   grid: [ columns, rows ] of the calibration table
+ *   sets: list of { ct, c0, c1, c2, c3 }, the gains of the four pixels of the Bayer quad in raster order (top left, top right,
+ *         bottom left, bottom right) as unsigned 12 bit fixed point (4096 = 1.0), row by row. Which colour each one is follows from
+ *         the CFA pattern of the sensor (BGGR: B, Gb, Gr, R).
+ *         "ct" is the position of the white point of the light source on the illuminant locus, with the same meaning
+ *         as the "ct" of the "ccms" of the Awb algorithm.
+ */
+
+namespace {
+
+/* Limits of the shading block, see struct ipu3_uapi_shd_lut. */
+constexpr unsigned int kMaxCellsPerSet = IPU3_UAPI_SHD_MAX_CELLS_PER_SET;
+constexpr unsigned int kMaxSets = IPU3_UAPI_SHD_MAX_CFG_SETS;
+constexpr unsigned int kMinGridSize = 8;
+constexpr unsigned int kMaxGridWidth = 128;
+constexpr unsigned int kMinBlockLog2 = 3;
+constexpr unsigned int kMaxBlockLog2 = 7;
+
+/*
+ * The ImgU gain is 1 + value / 1024 with the "gain factor" field set to 0, with a 12 bit value: range [1, 5).
+ * (Measured with a constant table: the brightness grows with the value and wraps around at 4096. The 16 bit
+ * range suggested by the header would be 1 + value / 16384.)
+ */
+constexpr double kGainScale = 1024.0;
+constexpr long kMaxGainValue = 4095;
+
+} /* namespace */
+
+Lsc::Lsc() = default;
+
+int Lsc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
+{
+	if (!tuningData.contains("sets"))
+		return 0;
+
+	const auto grid = tuningData["grid"].get<std::vector<unsigned int>>();
+	if (!grid || grid->size() != 2 || (*grid)[0] < 2 || (*grid)[1] < 2) {
+		LOG(IPU3Lsc, Error) << "Invalid or missing 'grid' in the Lsc tuning data";
+		return -EINVAL;
+	}
+
+	tableWidth_ = (*grid)[0];
+	tableHeight_ = (*grid)[1];
+	cellSize_ = tuningData["cell"].get<unsigned int>(64);
+
+	static const char *const names[kChannels] = { "c0", "c1", "c2", "c3" };
+
+	unsigned int i = 0;
+	for (const auto &entry : tuningData["sets"].asList()) {
+		Set set;
+		i++;
+		auto ct = entry["ct"].get<unsigned int>();
+		if (!ct) {
+			LOG(IPU3Lsc, Error) << "Lsc set " << i << " has no 'ct'";
+			return -EINVAL;
+		}
+		set.key = *ct;
+
+		for (unsigned int c = 0; c < kChannels; c++) {
+			auto values = entry[names[c]].get<std::vector<unsigned int>>();
+			if (!values || values->size() != tableWidth_ * tableHeight_) {
+				LOG(IPU3Lsc, Error) << "Lsc set " << i << ": '" << names[c]
+						    << "' does not have " << tableWidth_ * tableHeight_ << " values";
+				return -EINVAL;
+			}
+			set.table[c].resize(values->size());
+			for (unsigned int k = 0; k < values->size(); k++)
+				set.table[c][k] = (*values)[k] / 4096.0f;
+		}
+
+		sets_.push_back(std::move(set));
+	}
+
+	if (tuningData.contains("extra")) {
+		const auto r = tuningData["extra"]["r"].get<std::vector<double>>();
+		const auto b = tuningData["extra"]["b"].get<std::vector<double>>();
+		const auto g = tuningData["extra"]["g"].get<std::vector<double>>();
+		if (r && b && r->size() == kExtraPoints && b->size() == kExtraPoints) {
+			for (unsigned int n = 0; n < kExtraPoints; n++) {
+				extraR_[n] = (*r)[n];
+				extraB_[n] = (*b)[n];
+				if (g && g->size() == kExtraPoints)
+					extraG_[n] = (*g)[n];
+			}
+		} else {
+			LOG(IPU3Lsc, Warning) << "'extra' needs 'r' and 'b' lists of " << kExtraPoints << " values, ignored";
+		}
+	}
+
+	std::sort(sets_.begin(), sets_.end(),
+		  [](const Set &a, const Set &b) { return a.key < b.key; });
+
+	hasTables_ = !sets_.empty();
+	return 0;
+}
+
+int Lsc::configure([[maybe_unused]] IPAContext &context, const IPAConfigInfo &configInfo)
+{
+	ready_ = false;
+	if (!hasTables_)
+		return 0;
+
+	/*
+	 * The tables are in raster order of the Bayer quad; the ImgU wants them by colour (R, Gr, Gb, B).
+	 * Quad (top left, top right, bottom left, bottom right) of each CFA pattern, as table index of R, Gr, Gb and B:
+	 * Gr is the green on the rows of the red pixels, Gb the one on the rows of the blue pixels.
+	 */
+	static const unsigned int rasterOf[4][kChannels] = {
+		{ 0, 1, 2, 3 }, /* RGGB: R Gr / Gb B */
+		{ 1, 0, 3, 2 }, /* GRBG: Gr R / B Gb */
+		{ 2, 3, 0, 1 }, /* GBRG: Gb B / R Gr */
+		{ 3, 2, 1, 0 }, /* BGGR: B Gb / Gr R */
+	};
+	const uint32_t cfa = configInfo.sensorInfo.cfaPattern;
+	if (cfa > 3) {
+		LOG(IPU3Lsc, Warning) << "Unsupported CFA pattern " << cfa << ", lens shading disabled";
+		return 0;
+	}
+	for (unsigned int c = 0; c < kChannels; c++)
+		rasterOf_[c] = rasterOf[cfa][c];
+
+	const Size &bds = configInfo.bdsOutputSize;
+
+	/* Smallest cell size for which the grid fits in the look-up table of the block. */
+	for (unsigned int log2 = kMinBlockLog2; log2 <= kMaxBlockLog2; log2++) {
+		const unsigned int block = 1u << log2;
+		const unsigned int w = (bds.width + block - 1) / block + 1;
+		const unsigned int h = (bds.height + block - 1) / block + 1;
+
+		if (w < kMinGridSize || h < kMinGridSize || w > kMaxGridWidth || w > kMaxCellsPerSet)
+			continue;
+
+		const unsigned int perSlice = kMaxCellsPerSet / w;
+		if ((h + perSlice - 1) / perSlice > kMaxSets)
+			continue;
+
+		gridWidth_ = w;
+		gridHeight_ = h;
+		blockLog2_ = log2;
+		heightPerSlice_ = perSlice;
+		ready_ = true;
+		break;
+	}
+
+	if (!ready_) {
+		LOG(IPU3Lsc, Warning) << "No shading grid fits a BDS output of " << bds << ", lens shading disabled";
+		return 0;
+	}
+
+	resample(configInfo.sensorInfo, bds, configInfo.iif);
+
+	LOG(IPU3Lsc, Debug) << "Shading grid " << gridWidth_ << "x" << gridHeight_ << " cells of "
+			    << (1u << blockLog2_) << " pixels for BDS " << bds << ", IF " << configInfo.iif
+			    << ", sensor output " << configInfo.sensorInfo.outputSize << ", active area "
+			    << configInfo.sensorInfo.activeAreaSize;
+
+	return 0;
+}
+
+/*
+ * Position of the nodes of the ImgU grid on the pixel array: ImgU pixel -> input feeder pixel (scaling by the BDS) ->
+ * pixel of the sensor output (the input feeder window is centred) -> pixel of the array.
+ *
+ * The last step cannot use sensorInfo.analogCrop: the ov8865 driver reports the binned 1632x1224 mode (the whole field
+ * of view, 2x2 binned) as a 1:1 crop of that size in the middle of the array. The binning is deduced from the ratio
+ * between the active area and the sensor output instead (below 1.5 the mode is an unbinned crop), and the readout window
+ * is assumed to be centred on the array, which holds for the modes of the ov5693 and ov8865.
+ */
+void Lsc::resample(const IPACameraSensorInfo &sensorInfo, const Size &bds, const Size &iif)
+{
+	const double sx = static_cast<double>(iif.width) / bds.width;
+	const double sy = static_cast<double>(iif.height) / bds.height;
+	const double ox = (static_cast<double>(sensorInfo.outputSize.width) - iif.width) / 2.0;
+	const double oy = (static_cast<double>(sensorInfo.outputSize.height) - iif.height) / 2.0;
+
+	double bin = static_cast<double>(sensorInfo.activeAreaSize.width) / sensorInfo.outputSize.width;
+	bin = bin < 1.5 ? 1.0 : std::round(bin);
+	const double ax0 = (static_cast<double>(sensorInfo.activeAreaSize.width) - sensorInfo.outputSize.width * bin) / 2.0;
+	const double ay0 = (static_cast<double>(sensorInfo.activeAreaSize.height) - sensorInfo.outputSize.height * bin) / 2.0;
+	const double block = static_cast<double>(1u << blockLog2_);
+
+	nodeRadius_.assign(gridWidth_ * gridHeight_, 0.0f);
+	for (unsigned int j = 0; j < gridHeight_; j++) {
+		for (unsigned int i = 0; i < gridWidth_; i++) {
+			const double dx = (i * block - bds.width / 2.0) / (bds.width / 2.0);
+			const double dy = (j * block - bds.height / 2.0) / (bds.height / 2.0);
+			nodeRadius_[j * gridWidth_ + i] = static_cast<float>(std::hypot(dx, dy));
+		}
+	}
+
+	for (Set &set : sets_) {
+		for (unsigned int c = 0; c < kChannels; c++) {
+			std::vector<float> &out = set.grid[c];
+			out.assign(gridWidth_ * gridHeight_, 1.0f);
+
+			for (unsigned int j = 0; j < gridHeight_; j++) {
+				/* Pixel of the array, then cell coordinates of the calibration table (cell centres). */
+				const double y = ay0 + (oy + j * block * sy) * bin;
+				const double fy = std::clamp(y / cellSize_ - 0.5, 0.0, tableHeight_ - 1.0);
+				const unsigned int y0 = static_cast<unsigned int>(fy);
+				const unsigned int y1 = std::min(y0 + 1, tableHeight_ - 1);
+				const double wy = fy - y0;
+
+				for (unsigned int i = 0; i < gridWidth_; i++) {
+					const double x = ax0 + (ox + i * block * sx) * bin;
+					const double fx = std::clamp(x / cellSize_ - 0.5, 0.0, tableWidth_ - 1.0);
+					const unsigned int x0 = static_cast<unsigned int>(fx);
+					const unsigned int x1 = std::min(x0 + 1, tableWidth_ - 1);
+					const double wx = fx - x0;
+
+					const std::vector<float> &t = set.table[c];
+					const double top = t[y0 * tableWidth_ + x0] * (1 - wx) + t[y0 * tableWidth_ + x1] * wx;
+					const double bottom = t[y1 * tableWidth_ + x0] * (1 - wx) + t[y1 * tableWidth_ + x1] * wx;
+
+					out[j * gridWidth_ + i] = static_cast<float>(top * (1 - wy) + bottom * wy);
+				}
+			}
+		}
+	}
+}
+
+double Lsc::extraAt(const std::array<float, kExtraPoints> &e, double radius)
+{
+	const double x = std::clamp(radius / kExtraStep, 0.0, static_cast<double>(kExtraPoints - 1));
+	const unsigned int i = std::min(static_cast<unsigned int>(x), kExtraPoints - 2);
+	return e[i] + (e[i + 1] - e[i]) * (x - i);
+}
+
+void Lsc::prepare(IPAContext &context, const uint32_t frame,
+		  [[maybe_unused]] IPAFrameContext &frameContext, ipu3_uapi_params *params)
+{
+	if (!ready_)
+		return;
+
+	/* Weights of the two sets around the white point chosen by the AWB. */
+	const auto &gains = context.activeState.awb.gains;
+	unsigned int lo = 0, hi = 0;
+	double w = 0.0;
+	if (gains.red > 0 && gains.green > 0 && gains.blue > 0) {
+		const double rg = gains.green / gains.red;
+		const double bg = gains.green / gains.blue;
+		const long key = std::max(0L, std::lround(1000.0 * std::log(bg / rg)) + 5000);
+
+		if (key >= static_cast<long>(sets_.back().key)) {
+			lo = hi = sets_.size() - 1;
+		} else if (key > static_cast<long>(sets_.front().key)) {
+			while (hi < sets_.size() && static_cast<long>(sets_[hi].key) < key)
+				hi++;
+			lo = hi - 1;
+			w = static_cast<double>(key - sets_[lo].key) / (sets_[hi].key - sets_[lo].key);
+		}
+	}
+
+	if (frame % 90 == 0) {
+		LOG(IPU3Lsc, Debug) << "AWB gains R " << gains.red << " B " << gains.blue << ", tables " << sets_[lo].key
+				    << " (" << 1.0 - w << ") and " << sets_[hi].key << " (" << w << ")";
+	}
+
+	/* EXTRA TEST HOOK: /dev/shm/lscextra = 8 values for red then 8 for blue, replaces the tuning data */
+	std::array<float, kExtraPoints> exR = extraR_, exB = extraB_, exG = extraG_;
+	if (FILE *ef = fopen("/dev/shm/lscextra", "r")) {
+		float v[3 * kExtraPoints];
+		unsigned int n = 0;
+		while (n < 3 * kExtraPoints && fscanf(ef, "%f", &v[n]) == 1)
+			n++;
+		if (n >= 2 * kExtraPoints) {
+			for (unsigned int i = 0; i < kExtraPoints; i++) {
+				exR[i] = v[i];
+				exB[i] = v[kExtraPoints + i];
+				exG[i] = n == 3 * kExtraPoints ? v[2 * kExtraPoints + i] : 1.0f;
+			}
+		}
+		fclose(ef);
+	}
+
+	struct ipu3_uapi_shd_config &shd = params->acc_param.shd;
+
+	shd.shd.grid.width = gridWidth_;
+	shd.shd.grid.height = gridHeight_;
+	shd.shd.grid.block_width_log2 = blockLog2_;
+	shd.shd.grid.block_height_log2 = blockLog2_;
+	shd.shd.grid.grid_height_per_slice = heightPerSlice_;
+	shd.shd.grid.x_start = 0;
+	shd.shd.grid.y_start = 0;
+
+	shd.shd.general.init_set_vrt_offst_ul = 0;
+	shd.shd.general.shd_enable = 1;
+	shd.shd.general.gain_factor = 0;
+
+	shd.shd.black_level.bl_r = 0;
+	shd.shd.black_level.bl_gr = 0;
+	shd.shd.black_level.bl_gb = 0;
+	shd.shd.black_level.bl_b = 0;
+
+	auto code = [](double gain) {
+		return static_cast<uint16_t>(std::clamp<long>(std::lround((std::max(gain, 1.0) - 1.0) * kGainScale), 0, kMaxGainValue));
+	};
+
+	for (unsigned int j = 0; j < gridHeight_; j++) {
+		const unsigned int set = j / heightPerSlice_;
+		const unsigned int row = j % heightPerSlice_;
+
+		for (unsigned int i = 0; i < gridWidth_; i++) {
+			const unsigned int cell = row * gridWidth_ + i;
+			const unsigned int k = j * gridWidth_ + i;
+			double g[kChannels];
+			for (unsigned int c = 0; c < kChannels; c++)
+				g[c] = sets_[lo].grid[rasterOf_[c]][k] * (1.0 - w) + sets_[hi].grid[rasterOf_[c]][k] * w;
+
+			const double eg = extraAt(exG, nodeRadius_[k]);
+			g[0] *= extraAt(exR, nodeRadius_[k]) * eg;
+			g[1] *= eg;
+			g[2] *= eg;
+			g[3] *= extraAt(exB, nodeRadius_[k]) * eg;
+			shd.shd_lut.sets[set].r_and_gr[cell].r = code(g[0]);
+			shd.shd_lut.sets[set].r_and_gr[cell].gr = code(g[1]);
+			shd.shd_lut.sets[set].gb_and_b[cell].gb = code(g[2]);
+			shd.shd_lut.sets[set].gb_and_b[cell].b = code(g[3]);
+		}
+	}
+
+	params->use.acc_shd = 1;
+}
+
+REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
+
+} /* namespace ipa::ipu3::algorithms */
+
+} /* namespace libcamera */

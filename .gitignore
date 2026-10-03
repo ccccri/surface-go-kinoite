@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# scratch captures from the camera work
+nz2-prod.*
+samples/
+*.log

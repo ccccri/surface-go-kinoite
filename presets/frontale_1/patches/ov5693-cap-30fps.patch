@@ -1,0 +1,17 @@
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -760,7 +760,13 @@
+ 
+ 	unsigned int tgt_fps;
+ 
+-	tgt_fps = rounddown(OV5693_PIXEL_RATE / OV5693_FIXED_PPL / height, 30);
++	/*
++	 * Cap at 30 fps. The AE exposure limit follows VTS, and the binned 1296x972 mode
++	 * (used for small outputs such as 640x480) would otherwise default to 60 fps, which
++	 * halves the maximum exposure time (16.5 ms instead of 33 ms) and doubles the gain
++	 * needed in dim light.
++	 */
++	tgt_fps = min(30U, rounddown(OV5693_PIXEL_RATE / OV5693_FIXED_PPL / height, 30));
+ 
+ 	return ALIGN_DOWN(OV5693_PIXEL_RATE / OV5693_FIXED_PPL / tgt_fps, 2);
+ }

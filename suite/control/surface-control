@@ -1,0 +1,5 @@
+#!/bin/bash
+# launcher: runs the control panel from the guide directory recorded at install time
+GUIDE=${SURFACE_GUIDE:-@GUIDE@}
+export SURFACE_GUIDE=$GUIDE
+exec python3 "$GUIDE/suite/control/main.py" "$@"

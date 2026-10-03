@@ -1,0 +1,11 @@
+[Unit]
+Description=Warn when the patched Surface Go kernel modules are missing for the running kernel
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/surface-kmods-check @GUIDE@
+
+[Install]
+WantedBy=graphical-session.target

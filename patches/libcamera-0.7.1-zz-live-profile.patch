@@ -1,0 +1,738 @@
+diff --git a/include/libcamera/internal/live_profile.h b/include/libcamera/internal/live_profile.h
+new file mode 100644
+--- /dev/null
++++ b/include/libcamera/internal/live_profile.h
+@@ -0,0 +1,151 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Live camera profile of the Surface Linux suite
++ *
++ * Header-only, shared by the IPU3 pipeline handler and the IPU3 IPA (which run in different processes).
++ *
++ * <dir>/<sensor model>.profile   settings applied to every application (persistent)
++ * <dir>/<sensor model>.session   settings of one application: first line "pid <N>", ignored once process N is gone
++ *
++ * Both are text files, one "key value value ..." per line, '#' starts a comment. The session file wins over the profile.
++ * <dir> is $LIBCAMERA_SURFACE_PROFILE_DIR, else $XDG_CONFIG_HOME/surface-suite/camera, else $HOME/.config/surface-suite/camera.
++ * poll() looks at the files at most every 200 ms (modification time), so a change shows up within a fraction of a second.
++ */
++
++#pragma once
++
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include <sys/stat.h>
++
++namespace libcamera {
++
++class LiveProfile
++{
++public:
++	explicit LiveProfile(const std::string &model)
++	{
++		const char *d = getenv("LIBCAMERA_SURFACE_PROFILE_DIR");
++		const char *x = getenv("XDG_CONFIG_HOME");
++		const char *h = getenv("HOME");
++		std::string dir;
++		if (d && *d)
++			dir = d;
++		else if (x && *x)
++			dir = std::string(x) + "/surface-suite/camera";
++		else if (h && *h)
++			dir = std::string(h) + "/.config/surface-suite/camera";
++		if (!dir.empty()) {
++			profilePath_ = dir + "/" + model + ".profile";
++			sessionPath_ = dir + "/" + model + ".session";
++		}
++		load();
++	}
++
++	/* Returns true when the settings changed since the last call. */
++	bool poll()
++	{
++		const auto now = std::chrono::steady_clock::now();
++		if (now - lastPoll_ < std::chrono::milliseconds(200))
++			return false;
++		lastPoll_ = now;
++		const long long sig = signature();
++		if (sig == signature_)
++			return false;
++		load();
++		return true;
++	}
++
++	bool has(const std::string &key) const { return values_.count(key) != 0; }
++
++	double number(const std::string &key, double def) const
++	{
++		auto it = values_.find(key);
++		return it == values_.end() || it->second.empty() ? def : it->second[0];
++	}
++
++	/* The values of a key, empty when absent. */
++	std::vector<double> list(const std::string &key) const
++	{
++		auto it = values_.find(key);
++		return it == values_.end() ? std::vector<double>() : it->second;
++	}
++
++private:
++	static long long mtime(const std::string &path)
++	{
++		struct stat st;
++		if (path.empty() || stat(path.c_str(), &st) != 0)
++			return 0;
++		return static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
++	}
++
++	static bool alive(long pid)
++	{
++		struct stat st;
++		return pid > 0 && stat(("/proc/" + std::to_string(pid)).c_str(), &st) == 0;
++	}
++
++	/* Modification times of both files, plus whether the session owner is alive: any change means "reload". */
++	long long signature() const
++	{
++		return mtime(profilePath_) * 3 + mtime(sessionPath_) * 7 + (sessionAlive() ? 1 : 0);
++	}
++
++	bool sessionAlive() const
++	{
++		std::ifstream f(sessionPath_);
++		std::string word;
++		long pid = 0;
++		return f && (f >> word >> pid) && word == "pid" && alive(pid);
++	}
++
++	void parse(const std::string &path, bool session)
++	{
++		std::ifstream f(path);
++		std::string line;
++		bool first = true;
++		while (f && std::getline(f, line)) {
++			const size_t c = line.find('#');
++			if (c != std::string::npos)
++				line.resize(c);
++			std::istringstream in(line);
++			std::string key;
++			if (!(in >> key))
++				continue;
++			if (session && first) {
++				first = false;
++				if (key == "pid")
++					continue;
++			}
++			std::vector<double> v;
++			double n;
++			while (in >> n)
++				v.push_back(n);
++			values_[key] = v;
++		}
++	}
++
++	void load()
++	{
++		values_.clear();
++		signature_ = signature();
++		parse(profilePath_, false);
++		if (sessionAlive())
++			parse(sessionPath_, true);
++	}
++
++	std::string profilePath_;
++	std::string sessionPath_;
++	std::map<std::string, std::vector<double>> values_;
++	long long signature_ = -1;
++	std::chrono::steady_clock::time_point lastPoll_;
++};
++
++} /* namespace libcamera */
+diff --git a/src/ipa/ipu3/algorithms/af.cpp b/src/ipa/ipu3/algorithms/af.cpp
+--- a/src/ipa/ipu3/algorithms/af.cpp
++++ b/src/ipa/ipu3/algorithms/af.cpp
+@@ -11,6 +11,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <fcntl.h>
++#include <fstream>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -254,6 +255,10 @@
+ 	/* Initial frame ignore counter */
+ 	afIgnoreFrameReset();
+ 
++	profile_ = std::make_unique<LiveProfile>(configInfo.sensorInfo.model);
++	stateFile_ = "/dev/shm/surface-camera-" + configInfo.sensorInfo.model + ".state";
++	manual_ = false;
++
+ 	/* Initial focus value */
+ 	context.activeState.af.focus = 0;
+ 	/* Maximum variance of the AF statistics */
+@@ -820,6 +825,30 @@
+ 	 */
+ 	currentVariance_ = afEstimateVariance(y_items, true);
+ 
++	/*
++	 * Manual focus from the live profile ("focus <step>"): park the lens and do not search. Removing the key
++	 * starts a local search from where the lens is. The lens position and sharpness are written to a state file
++	 * (a few times a second) for the control panel.
++	 */
++	if (profile_) {
++		profile_->poll();
++		const bool manual = profile_->has("focus");
++		if (manual) {
++			context.activeState.af.focus = std::clamp<double>(profile_->number("focus", 0), 0, kMaxFocusSteps);
++			context.activeState.af.stable = true;
++		} else if (manual_) {
++			afRescan(context);
++		}
++		manual_ = manual;
++		if (++stateCounter_ % 8 == 0) {
++			std::ofstream st(stateFile_, std::ios::trunc);
++			st << "focus " << context.activeState.af.focus << "\nsharpness " << currentVariance_
++			   << "\nmanual " << (manual_ ? 1 : 0) << "\n";
++		}
++		if (manual_)
++			return;
++	}
++
+ 	const double aeTotal = static_cast<double>(context.activeState.agc.exposure) *
+ 			       context.activeState.agc.gain;
+ 	if (aeTotal_ > 0.0 && std::abs(aeTotal / aeTotal_ - 1.0) > kAeStableTolerance)
+diff --git a/src/ipa/ipu3/algorithms/af.h b/src/ipa/ipu3/algorithms/af.h
+--- a/src/ipa/ipu3/algorithms/af.h
++++ b/src/ipa/ipu3/algorithms/af.h
+@@ -16,6 +16,11 @@
+ 
+ #include <libcamera/geometry.h>
+ 
++#include <memory>
++#include <string>
++
++#include "libcamera/internal/live_profile.h"
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -103,6 +108,11 @@
+ 	double localBestVar_ = 0.0;
+ 	int64_t localBestFocus_ = 0;
+ 	std::vector<std::pair<int64_t, double>> localSamples_;
++	/* Live profile: "focus <step>" parks the lens there (manual focus), see process(). */
++	std::unique_ptr<LiveProfile> profile_;
++	std::string stateFile_;
++	bool manual_ = false;
++	uint32_t stateCounter_ = 0;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */
+diff --git a/src/ipa/ipu3/algorithms/agc.cpp b/src/ipa/ipu3/algorithms/agc.cpp
+--- a/src/ipa/ipu3/algorithms/agc.cpp
++++ b/src/ipa/ipu3/algorithms/agc.cpp
+@@ -101,8 +101,9 @@
+  * \return 0
+  */
+ int Agc::configure(IPAContext &context,
+-		   [[maybe_unused]] const IPAConfigInfo &configInfo)
++		   const IPAConfigInfo &configInfo)
+ {
++	profile_ = std::make_unique<LiveProfile>(configInfo.sensorInfo.model);
+ 	const IPASessionConfiguration &configuration = context.configuration;
+ 	IPAActiveState &activeState = context.activeState;
+ 
+@@ -218,6 +219,12 @@
+ 	if (frame < kAgcSkipFrames)
+ 		return;
+ 
++	/* Live exposure compensation in stops ("exposure" key of the camera profile). */
++	if (profile_) {
++		profile_->poll();
++		setExposureCompensation(std::pow(2.0, std::clamp(profile_->number("exposure", 0.0), -3.0, 3.0)));
++	}
++
+ 	Histogram hist = parseStatistics(stats, context.configuration.grid.bdsGrid);
+ 	rGain_ = context.activeState.awb.gains.red;
+ 	gGain_ = context.activeState.awb.gains.blue;
+diff --git a/src/ipa/ipu3/algorithms/agc.h b/src/ipa/ipu3/algorithms/agc.h
+--- a/src/ipa/ipu3/algorithms/agc.h
++++ b/src/ipa/ipu3/algorithms/agc.h
+@@ -18,6 +18,10 @@
+ 
+ #include "algorithm.h"
+ 
++#include <memory>
++
++#include "libcamera/internal/live_profile.h"
++
+ namespace libcamera {
+ 
+ struct IPACameraSensorInfo;
+@@ -53,6 +57,7 @@
+ 	double gGain_;
+ 	double bGain_;
+ 	ipu3_uapi_grid_config bdsGrid_;
++	std::unique_ptr<LiveProfile> profile_;
+ 	std::vector<std::tuple<uint8_t, uint8_t, uint8_t>> rgbTriples_;
+ };
+ 
+diff --git a/src/ipa/ipu3/algorithms/blc.cpp b/src/ipa/ipu3/algorithms/blc.cpp
+--- a/src/ipa/ipu3/algorithms/blc.cpp
++++ b/src/ipa/ipu3/algorithms/blc.cpp
+@@ -86,24 +86,48 @@
+ 	return 0;
+ }
+ 
++int BlackLevelCorrection::configure([[maybe_unused]] IPAContext &context, const IPAConfigInfo &configInfo)
++{
++	profile_ = std::make_unique<LiveProfile>(configInfo.sensorInfo.model);
++	return 0;
++}
++
+ void BlackLevelCorrection::prepare([[maybe_unused]] IPAContext &context,
+ 				   [[maybe_unused]] const uint32_t frame,
+ 				   [[maybe_unused]] IPAFrameContext &frameContext,
+ 				   ipu3_uapi_params *params)
+ {
+ 	/* The Optical Black Level correction values: from the tuning data ("black"), 64 otherwise. */
+-	params->obgrid_param.gr = black_[0];
+-	params->obgrid_param.r = black_[1];
+-	params->obgrid_param.b = black_[2];
+-	params->obgrid_param.gb = black_[3];
++	/* The live profile ("black" and "bnr" keys) overrides the tuning data. */
++	std::array<uint16_t, 4> black = black_;
++	std::array<unsigned int, 6> bnr = bnr_;
++	bool hasBnr = hasBnr_;
++	if (profile_) {
++		profile_->poll();
++		const auto lb = profile_->list("black");
++		if (lb.size() == 4)
++			for (unsigned int i = 0; i < 4; i++)
++				black[i] = std::min(std::max(lb[i], 0.0), 255.0);
++		const auto ln = profile_->list("bnr");
++		if (ln.size() == 6) {
++			for (unsigned int i = 0; i < 6; i++)
++				bnr[i] = std::max(ln[i], 0.0);
++			hasBnr = true;
++		}
++	}
++
++	params->obgrid_param.gr = black[0];
++	params->obgrid_param.r = black[1];
++	params->obgrid_param.b = black[2];
++	params->obgrid_param.gb = black[3];
+ 
+-	if (hasBnr_ && params->use.acc_bnr) {
+-		params->acc_param.bnr.thr_coeffs.cf = std::min(bnr_[0], 8191u);
+-		params->acc_param.bnr.thr_coeffs.cg = bnr_[1] & 0x1f;
+-		params->acc_param.bnr.dn_detect_ctrl.alpha = bnr_[2] & 0xf;
+-		params->acc_param.bnr.dn_detect_ctrl.beta = bnr_[3] & 0xf;
+-		params->acc_param.bnr.dn_detect_ctrl.gamma = bnr_[4] & 0xf;
+-		params->acc_param.bnr.dn_detect_ctrl.max_inf = bnr_[5] & 0xf;
++	if (hasBnr && params->use.acc_bnr) {
++		params->acc_param.bnr.thr_coeffs.cf = std::min(bnr[0], 8191u);
++		params->acc_param.bnr.thr_coeffs.cg = bnr[1] & 0x1f;
++		params->acc_param.bnr.dn_detect_ctrl.alpha = bnr[2] & 0xf;
++		params->acc_param.bnr.dn_detect_ctrl.beta = bnr[3] & 0xf;
++		params->acc_param.bnr.dn_detect_ctrl.gamma = bnr[4] & 0xf;
++		params->acc_param.bnr.dn_detect_ctrl.max_inf = bnr[5] & 0xf;
+ 	}
+ 
+ 	/* Enable the custom black level correction processing */
+diff --git a/src/ipa/ipu3/algorithms/blc.h b/src/ipa/ipu3/algorithms/blc.h
+--- a/src/ipa/ipu3/algorithms/blc.h
++++ b/src/ipa/ipu3/algorithms/blc.h
+@@ -8,6 +8,9 @@
+ #pragma once
+ 
+ #include <array>
++#include <memory>
++
++#include "libcamera/internal/live_profile.h"
+ 
+ #include "algorithm.h"
+ 
+@@ -21,6 +24,7 @@
+ 	BlackLevelCorrection();
+ 
+ 	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     ipu3_uapi_params *params) override;
+@@ -30,6 +34,7 @@
+ 	std::array<uint16_t, 4> black_{ 64, 64, 64, 64 };
+ 	std::array<unsigned int, 6> bnr_{};
+ 	bool hasBnr_ = false;
++	std::unique_ptr<LiveProfile> profile_;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */
+diff --git a/src/ipa/ipu3/algorithms/tone_mapping.cpp b/src/ipa/ipu3/algorithms/tone_mapping.cpp
+--- a/src/ipa/ipu3/algorithms/tone_mapping.cpp
++++ b/src/ipa/ipu3/algorithms/tone_mapping.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "tone_mapping.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <string.h>
+ #include <string>
+@@ -57,10 +58,12 @@
+  * \return 0
+  */
+ int ToneMapping::configure(IPAContext &context,
+-			   [[maybe_unused]] const IPAConfigInfo &configInfo)
++			   const IPAConfigInfo &configInfo)
+ {
+ 	/* Initialise tone mapping gamma value. */
+ 	context.activeState.toneMapping.gamma = 0.0;
++	curGamma_ = -1.0;
++	profile_ = std::make_unique<LiveProfile>(configInfo.sensorInfo.model);
+ 
+ 	return 0;
+ }
+@@ -107,7 +110,25 @@
+ 			  [[maybe_unused]] const ipu3_uapi_stats_3a *stats,
+ 			  [[maybe_unused]] ControlList &metadata)
+ {
+-	if (context.activeState.toneMapping.gamma == gamma_)
++	/* The live profile ("gamma" and "contrast" keys) overrides the tuning file. */
++	double liveGamma = gamma_;
++	double liveContrast = contrast_;
++	double liveShadows = 0.0;
++	double liveHighlights = 0.0;
++	bool liveSrgb = srgb_;
++	if (profile_) {
++		profile_->poll();
++		if (profile_->has("gamma")) {
++			liveGamma = profile_->number("gamma", gamma_);
++			liveSrgb = false;
++		}
++		liveContrast = profile_->number("contrast", contrast_);
++		liveShadows = profile_->number("shadows", 0.0);
++		liveHighlights = profile_->number("highlights", 0.0);
++	}
++
++	if (curGamma_ == liveGamma && curContrast_ == liveContrast && curSrgb_ == liveSrgb &&
++	    curShadows_ == liveShadows && curHighlights_ == liveHighlights)
+ 		return;
+ 
+ 	struct ipu3_uapi_gamma_corr_lut &lut =
+@@ -116,18 +137,30 @@
+ 	for (uint32_t i = 0; i < std::size(lut.lut); i++) {
+ 		double j = static_cast<double>(i) / (std::size(lut.lut) - 1);
+ 		double gamma;
+-		if (srgb_)
++		if (liveSrgb)
+ 			gamma = j <= 0.0031308 ? 12.92 * j : 1.055 * std::pow(j, 1.0 / 2.4) - 0.055;
+ 		else
+-			gamma = std::pow(j, 1.0 / gamma_);
++			gamma = std::pow(j, 1.0 / liveGamma);
+ 		/* Optional S curve: darkens the shadows and brightens the highlights without moving the mid tones. */
+-		gamma += contrast_ * (gamma * gamma * (3.0 - 2.0 * gamma) - gamma);
++		gamma += liveContrast * (gamma * gamma * (3.0 - 2.0 * gamma) - gamma);
++		/*
++		 * Shadows and highlights (-1 to 1): bumps centred on one third and two thirds of the range
++		 * that raise (positive) or lower (negative) the dark and the bright part of the curve.
++		 */
++		gamma += 0.15 * liveShadows * 6.75 * gamma * (1.0 - gamma) * (1.0 - gamma);
++		gamma += 0.15 * liveHighlights * 6.75 * gamma * gamma * (1.0 - gamma);
++		gamma = std::clamp(gamma, 0.0, 1.0);
+ 
+ 		/* The output value is expressed on 13 bits. */
+ 		lut.lut[i] = gamma * 8191;
+ 	}
+ 
+ 	context.activeState.toneMapping.gamma = gamma_;
++	curGamma_ = liveGamma;
++	curContrast_ = liveContrast;
++	curSrgb_ = liveSrgb;
++	curShadows_ = liveShadows;
++	curHighlights_ = liveHighlights;
+ }
+ 
+ REGISTER_IPA_ALGORITHM(ToneMapping, "ToneMapping")
+diff --git a/src/ipa/ipu3/algorithms/tone_mapping.h b/src/ipa/ipu3/algorithms/tone_mapping.h
+--- a/src/ipa/ipu3/algorithms/tone_mapping.h
++++ b/src/ipa/ipu3/algorithms/tone_mapping.h
+@@ -7,6 +7,9 @@
+ 
+ #pragma once
+ 
++#include <memory>
++
++#include "libcamera/internal/live_profile.h"
+ #include "libcamera/internal/value_node.h"
+ 
+ #include "algorithm.h"
+@@ -33,6 +36,12 @@
+ 	double gamma_;
+ 	bool srgb_ = false;
+ 	double contrast_ = 0.0;
++	double curGamma_ = -1.0;
++	double curContrast_ = -1.0;
++	double curShadows_ = 0.0;
++	double curHighlights_ = 0.0;
++	bool curSrgb_ = false;
++	std::unique_ptr<LiveProfile> profile_;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */
+diff --git a/src/libcamera/pipeline/ipu3/ipu3.cpp b/src/libcamera/pipeline/ipu3/ipu3.cpp
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
+ #include <array>
+ #include <cstdint>
+ #include <cstdio>
+@@ -36,6 +38,7 @@
+ #include "libcamera/internal/delayed_controls.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/live_profile.h"
+ #include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+@@ -65,6 +68,8 @@
+ 
+ 	void imguOutputBufferReady(FrameBuffer *buffer);
+ 	void temporalDenoise(const Stream *stream, FrameBuffer *buffer);
++	void colourGrade(const Stream *stream, FrameBuffer *buffer);
++	std::unique_ptr<LiveProfile> profile_;
+ 	void cio2BufferReady(FrameBuffer *buffer);
+ 	void paramBufferReady(FrameBuffer *buffer);
+ 	void statBufferReady(FrameBuffer *buffer);
+@@ -211,6 +216,15 @@
+ 	if (data_->cio2_.sensor()->model() == "ov8865")
+ 		combinedTransform_ ^= Transform::HFlip;
+ 
++	/* "mirror 1" and "flip 1" of the live profile flip the picture on top of that (read when the camera is configured). */
++	{
++		LiveProfile profile(data_->cio2_.sensor()->model());
++		if (profile.number("mirror", 0) > 0.5)
++			combinedTransform_ ^= Transform::HFlip;
++		if (profile.number("flip", 0) > 0.5)
++			combinedTransform_ ^= Transform::VFlip;
++	}
++
+ 	/* Cap the number of entries to the available streams. */
+ 	if (config_.size() > kMaxStreams) {
+ 		config_.resize(kMaxStreams);
+@@ -283,6 +297,16 @@
+ 					     ImgUDevice::kOutputMarginHeight })
+ 				  .boundedTo(data_->cio2_.sensor()->resolution());
+ 
++	/*
++	 * The OV5693 sends no data in its binned modes when a flip is on (CSI-2 "payload length ... received 0", black picture):
++	 * with a flip requested use the full resolution mode, the ImgU scales the picture down.
++	 */
++	if (data_->cio2_.sensor()->model() == "ov5693") {
++		LiveProfile profile(data_->cio2_.sensor()->model());
++		if (profile.number("mirror", 0) > 0.5 || profile.number("flip", 0) > 0.5)
++			rawSize = data_->cio2_.sensor()->resolution();
++	}
++
+ 	cio2Configuration_ = data_->cio2_.generateConfiguration(rawSize);
+ 	if (!cio2Configuration_.pixelFormat.isValid())
+ 		return Invalid;
+@@ -491,7 +515,10 @@
+ 				 */
+ 				std::vector<SizeRange> rearSizes;
+ 				const char *minWidth = getenv("LIBCAMERA_IPU3_REAR_MIN_WIDTH");
+-				const unsigned int minW = minWidth ? strtoul(minWidth, nullptr, 10) : 0;
++				unsigned int minW = minWidth ? strtoul(minWidth, nullptr, 10) : 0;
++				LiveProfile profile(data->cio2_.sensor()->model());
++				if (profile.has("min_width"))
++					minW = profile.number("min_width", 0);
+ 				for (const Size &s : { Size{ 1536, 1152 }, Size{ 2048, 1536 }, Size{ 2560, 1920 }, Size{ 3200, 2400 } })
+ 					if (s.width >= minW)
+ 						rearSizes.emplace_back(s);
+@@ -500,6 +527,18 @@
+ 				/* The first size is the one applications such as Kamoso take: LIBCAMERA_IPU3_REAR_MIN_WIDTH picks it. */
+ 				size = rearSizes.front().max;
+ 				streamFormats[pixelFormat] = rearSizes;
++			} else {
++				/* The front camera: same idea, and "min_width" of its live profile picks the first size offered. */
++				std::vector<SizeRange> frontSizes;
++				LiveProfile profile(data->cio2_.sensor()->model());
++				const unsigned int minW = profile.number("min_width", 0);
++				for (const Size &s : { Size{ 1152, 864 }, Size{ 1536, 1152 }, Size{ 2048, 1536 }, Size{ 2560, 1920 } })
++					if (s.width >= minW && s.width <= maxSize.width)
++						frontSizes.emplace_back(s);
++				if (!frontSizes.empty()) {
++					size = frontSizes.front().max;
++					streamFormats[pixelFormat] = frontSizes;
++				}
+ 			}
+ 
+ 			break;
+@@ -607,6 +646,17 @@
+ 	if (imguConfig.isNull())
+ 		return 0;
+ 
++	/*
++	 * The OV5693 (front camera) changes its Bayer order when only one of the two flips is on (measured: GBRG instead of
++	 * BGGR), and its driver reports neither: the picture turns purple. The raw data is laid out the same way whatever the
++	 * order, so tell the ImgU the right one. Both flips on, or none, keep BGGR.
++	 */
++	if (cio2->sensor()->model() == "ov5693") {
++		LiveProfile profile(cio2->sensor()->model());
++		if ((profile.number("mirror", 0) > 0.5) != (profile.number("flip", 0) > 0.5))
++			cio2Format.fourcc = V4L2PixelFormat::fromPixelFormat(formats::SGBRG10_IPU3).front();
++	}
++
+ 	ret = imgu->configure(imguConfig, &cio2Format);
+ 	if (ret)
+ 		return ret;
+@@ -1322,16 +1372,28 @@
+  */
+ void IPU3CameraData::temporalDenoise(const Stream *stream, FrameBuffer *buffer)
+ {
+-	static const struct Params {
++	struct Params {
+ 		int minWeight = 48;
+ 		int threshold = 12;
+-		Params()
+-		{
+-			const char *env = getenv("LIBCAMERA_IPU3_TNR");
+-			if (env)
+-				sscanf(env, "%d %d", &minWeight, &threshold);
+-		}
+ 	} params;
++	static const Params envParams = [] {
++		Params p;
++		const char *env = getenv("LIBCAMERA_IPU3_TNR");
++		if (env)
++			sscanf(env, "%d %d", &p.minWeight, &p.threshold);
++		return p;
++	}();
++	params = envParams;
++
++	/* The live profile ("tnr <min weight> <threshold>") wins over the environment. */
++	if (!profile_)
++		profile_ = std::make_unique<LiveProfile>(cio2_.sensor()->model());
++	profile_->poll();
++	const auto tnr = profile_->list("tnr");
++	if (tnr.size() == 2) {
++		params.minWeight = std::clamp(static_cast<int>(tnr[0]), 0, 256);
++		params.threshold = static_cast<int>(tnr[1]);
++	}
+ 
+ 	if (params.threshold <= 0)
+ 		return;
+@@ -1387,6 +1449,93 @@
+ 	filter(uv, prev.data() + ySize, height / 2);
+ }
+ 
++/*
++ * Colour grading and sharpening of the NV12 output, in software, from the live profile: "saturation" (1 = unchanged),
++ * "hue" (degrees), "temperature" and "tint" (-1 to 1; temperature moves the chroma towards red/blue, tint towards
++ * magenta/green) all act on the interleaved U/V plane, "sharpness" (0 to 2) is an unsharp mask on the luma with a
++ * small coring so that it does not amplify the sensor noise. Done after temporalDenoise(), whose filter memory
++ * therefore stays free of the grading. Costs nothing when every value is neutral.
++ */
++void IPU3CameraData::colourGrade(const Stream *stream, FrameBuffer *buffer)
++{
++	if (!profile_)
++		profile_ = std::make_unique<LiveProfile>(cio2_.sensor()->model());
++	profile_->poll();
++
++	const double sat = profile_->number("saturation", 1.0);
++	/* "hue_spin" (degrees per second) turns the hue wheel all the time: the rainbow effect. */
++	const double spin = profile_->number("hue_spin", 0.0);
++	double hue = profile_->number("hue", 0.0);
++	if (spin != 0.0) {
++		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++		hue += std::fmod(spin * t, 360.0);
++	}
++	const double temp = profile_->number("temperature", 0.0);
++	const double tint = profile_->number("tint", 0.0);
++	const double sharp = profile_->number("sharpness", 0.0);
++	const bool chroma = sat != 1.0 || hue != 0.0 || spin != 0.0 || temp != 0.0 || tint != 0.0;
++	if (!chroma && sharp <= 0.0)
++		return;
++
++	const StreamConfiguration &cfg = stream->configuration();
++	if (cfg.pixelFormat != formats::NV12)
++		return;
++
++	MappedFrameBuffer mapped(buffer, MappedFrameBuffer::MapFlag::ReadWrite);
++	if (!mapped.isValid() || mapped.planes().size() < 2)
++		return;
++
++	const unsigned int width = cfg.size.width;
++	const unsigned int height = cfg.size.height;
++	const unsigned int stride = cfg.stride;
++	uint8_t *y = mapped.planes()[0].data();
++	uint8_t *uv = mapped.planes()[1].data();
++	if (mapped.planes()[0].size() < static_cast<size_t>(stride) * height ||
++	    mapped.planes()[1].size() < static_cast<size_t>(stride) * height / 2)
++		return;
++
++	if (sharp > 0.0 && width > 2 && height > 2) {
++		const int amount = static_cast<int>(std::clamp(sharp, 0.0, 3.0) * 16);
++		std::vector<uint8_t> prevRow(y, y + width), curRow(width);
++		for (unsigned int r = 1; r + 1 < height; r++) {
++			uint8_t *row = y + static_cast<size_t>(r) * stride;
++			const uint8_t *next = row + stride;
++			std::copy(row, row + width, curRow.begin());
++			for (unsigned int x = 1; x + 1 < width; x++) {
++				const int c = curRow[x];
++				const int blur = (prevRow[x] + next[x] + curRow[x - 1] + curRow[x + 1] + 4 * c) / 8;
++				int d = c - blur;
++				/* Coring: a difference of one level is noise, leave it alone. */
++				d = d > 1 ? d - 1 : (d < -1 ? d + 1 : 0);
++				const int v = c + (d * amount) / 16;
++				row[x] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
++			}
++			prevRow.swap(curRow);
++		}
++	}
++
++	if (chroma) {
++		const double rad = hue * M_PI / 180.0;
++		const int a = static_cast<int>(std::lround(sat * std::cos(rad) * 256));
++		const int b = static_cast<int>(std::lround(-sat * std::sin(rad) * 256));
++		const int c = static_cast<int>(std::lround(sat * std::sin(rad) * 256));
++		const int d = a;
++		const int offU = static_cast<int>(std::lround((tint * 10.0 - temp * 12.0) * 256));
++		const int offV = static_cast<int>(std::lround((tint * 10.0 + temp * 12.0) * 256));
++		for (unsigned int r = 0; r < height / 2; r++) {
++			uint8_t *row = uv + static_cast<size_t>(r) * stride;
++			for (unsigned int x = 0; x + 1 < width; x += 2) {
++				const int du = row[x] - 128;
++				const int dv = row[x + 1] - 128;
++				int u = 128 + (a * du + b * dv + offU + 128) / 256;
++				int v = 128 + (c * du + d * dv + offV + 128) / 256;
++				row[x] = static_cast<uint8_t>(u < 0 ? 0 : (u > 255 ? 255 : u));
++				row[x + 1] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
++			}
++		}
++	}
++}
++
+ void IPU3CameraData::imguOutputBufferReady(FrameBuffer *buffer)
+ {
+ 	IPU3Frames::Info *info = frameInfos_.find(buffer);
+@@ -1398,6 +1547,7 @@
+ 	for (const auto &[stream, b] : request->buffers()) {
+ 		if (b == buffer) {
+ 			temporalDenoise(stream, buffer);
++			colourGrade(stream, buffer);
+ 			break;
+ 		}
+ 	}

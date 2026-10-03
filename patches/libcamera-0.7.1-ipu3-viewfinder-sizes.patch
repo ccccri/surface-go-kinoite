@@ -1,0 +1,63 @@
+diff --git a/src/libcamera/pipeline/ipu3/ipu3.cpp b/src/libcamera/pipeline/ipu3/ipu3.cpp
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp
+@@ -135,7 +135,9 @@
+ {
+ public:
+ 	static constexpr unsigned int V4L2_CID_IPU3_PIPE_MODE = 0x009819c1;
+-	static constexpr Size kViewfinderSize{ 1280, 720 };
++	static constexpr Size kViewfinderSize{ 1280, 960 };
++	/* Smallest viewfinder / video size offered to applications. */
++	static constexpr Size kMinOfferedSize{ 1152, 864 };
+ 
+ 	enum IPU3PipeModes {
+ 		IPU3PipeModeVideo = 0,
+@@ -460,16 +462,45 @@
+ 		case StreamRole::Viewfinder:
+ 		case StreamRole::VideoRecording: {
+ 			/*
+-			 * Default viewfinder and videorecording to 1280x720,
++			 * Default viewfinder and videorecording to 1280x960,
+ 			 * capped to the maximum sensor resolution and aligned
+-			 * to the ImgU output constraints.
++			 * to the ImgU output constraints. The sizes offered go
++			 * all the way up to the largest picture the ImgU can
++			 * produce, but never below kMinOfferedSize: the PipeWire
++			 * plugin puts the size closest to 640x480 first and
++			 * applications such as Kamoso simply take it, so a
++			 * 640x480 on offer means pictures of 0.3 megapixels.
+ 			 */
+ 			size = sensorResolution.boundedTo(kViewfinderSize)
+ 					       .alignedDownTo(ImgUDevice::kOutputAlignWidth,
+ 							      ImgUDevice::kOutputAlignHeight);
++			Size maxSize = sensorResolution.boundedTo(ImgUDevice::kOutputMaxSize)
++						       .alignedDownTo(ImgUDevice::kOutputAlignWidth,
++								      ImgUDevice::kOutputAlignHeight);
+ 			pixelFormat = formats::NV12;
+ 			bufferCount = IPU3CameraConfiguration::kBufferCount;
+-			streamFormats[pixelFormat] = { { ImgUDevice::kOutputMinSize, size } };
++			streamFormats[pixelFormat] = { { kMinOfferedSize, maxSize } };
++
++			if (data->cio2_.sensor()->model() == "ov8865") {
++				/*
++				 * The rear camera: the 1632x1224 binned sensor mode streams at 30 fps and the ImgU needs
++				 * kOutputMargin* of margin around the picture, so 1536x1152 (aligned to the ImgU) is the
++				 * largest 4:3 size at 30 fps. The PipeWire plugin only lists standard sizes for a range,
++				 * and none of them is both 4:3 and aligned above 1152x864, so list the sizes explicitly.
++				 * Bigger sizes need the full 3264x2448 mode (about 15 fps).
++				 */
++				std::vector<SizeRange> rearSizes;
++				const char *minWidth = getenv("LIBCAMERA_IPU3_REAR_MIN_WIDTH");
++				const unsigned int minW = minWidth ? strtoul(minWidth, nullptr, 10) : 0;
++				for (const Size &s : { Size{ 1536, 1152 }, Size{ 2048, 1536 }, Size{ 2560, 1920 }, Size{ 3200, 2400 } })
++					if (s.width >= minW)
++						rearSizes.emplace_back(s);
++				if (rearSizes.empty())
++					rearSizes.emplace_back(Size{ 1536, 1152 });
++				/* The first size is the one applications such as Kamoso take: LIBCAMERA_IPU3_REAR_MIN_WIDTH picks it. */
++				size = rearSizes.front().max;
++				streamFormats[pixelFormat] = rearSizes;
++			}
+ 
+ 			break;
+ 		}

@@ -1,0 +1,97 @@
+--- a/src/ipa/ipu3/algorithms/tone_mapping.cpp	2026-10-01 18:54:54.617565837 +0200
++++ b/src/ipa/ipu3/algorithms/tone_mapping.cpp	2026-10-01 19:05:40.138884321 +0200
+@@ -9,6 +9,7 @@
+ 
+ #include <cmath>
+ #include <string.h>
++#include <string>
+ 
+ /**
+  * \file tone_mapping.h
+@@ -27,11 +28,28 @@
+  */
+ 
+ ToneMapping::ToneMapping()
+-	: gamma_(1.0)
++	: gamma_(1.1)
+ {
+ }
+ 
+ /**
++ * \copydoc libcamera::ipa::Algorithm::init
++ *
++ * The optional "gamma" tuning value is the exponent of the tone curve (1.1 by default, which is nearly linear and
++ * leaves dark objects crushed on a display); "curve: srgb" selects the sRGB transfer function (linear toe, then
++ * a 2.4 power), the encoding that displays and image viewers expect. "contrast" (0 to 1) blends in a smoothstep S curve
++ * to bring back the deep blacks that a low gamma exponent lifts.
++ */
++int ToneMapping::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	gamma_ = tuningData["gamma"].get<double>(1.1);
++	srgb_ = tuningData["curve"].get<std::string>("") == "srgb";
++	contrast_ = tuningData["contrast"].get<double>(0.0);
++
++	return 0;
++}
++
++/**
+  * \brief Configure the tone mapping given a configInfo
+  * \param[in] context The shared IPA context
+  * \param[in] configInfo The IPA configuration data
+@@ -89,13 +107,6 @@
+ 			  [[maybe_unused]] const ipu3_uapi_stats_3a *stats,
+ 			  [[maybe_unused]] ControlList &metadata)
+ {
+-	/*
+-	 * Hardcode gamma to 1.1 as a default for now.
+-	 *
+-	 * \todo Expose gamma control setting through the libcamera control API
+-	 */
+-	gamma_ = 1.1;
+-
+ 	if (context.activeState.toneMapping.gamma == gamma_)
+ 		return;
+ 
+@@ -104,7 +115,13 @@
+ 
+ 	for (uint32_t i = 0; i < std::size(lut.lut); i++) {
+ 		double j = static_cast<double>(i) / (std::size(lut.lut) - 1);
+-		double gamma = std::pow(j, 1.0 / gamma_);
++		double gamma;
++		if (srgb_)
++			gamma = j <= 0.0031308 ? 12.92 * j : 1.055 * std::pow(j, 1.0 / 2.4) - 0.055;
++		else
++			gamma = std::pow(j, 1.0 / gamma_);
++		/* Optional S curve: darkens the shadows and brightens the highlights without moving the mid tones. */
++		gamma += contrast_ * (gamma * gamma * (3.0 - 2.0 * gamma) - gamma);
+ 
+ 		/* The output value is expressed on 13 bits. */
+ 		lut.lut[i] = gamma * 8191;
+--- a/src/ipa/ipu3/algorithms/tone_mapping.h	2026-10-01 18:54:55.304568793 +0200
++++ b/src/ipa/ipu3/algorithms/tone_mapping.h	2026-10-01 19:05:40.138935782 +0200
+@@ -7,6 +7,8 @@
+ 
+ #pragma once
+ 
++#include "libcamera/internal/value_node.h"
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -18,6 +20,7 @@
+ public:
+ 	ToneMapping();
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext, ipu3_uapi_params *params) override;
+@@ -28,6 +31,8 @@
+ 
+ private:
+ 	double gamma_;
++	bool srgb_ = false;
++	double contrast_ = 0.0;
+ };
+ 
+ } /* namespace ipa::ipu3::algorithms */

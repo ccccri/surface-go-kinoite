@@ -1,0 +1,144 @@
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp	2026-10-02 11:29:51.371914563 +0200
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp	2026-10-02 11:31:39.497365331 +0200
+@@ -6,6 +6,11 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
+ #include <memory>
+ #include <queue>
+ #include <vector>
+@@ -31,6 +36,7 @@
+ #include "libcamera/internal/delayed_controls.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+ #include "libcamera/internal/request.h"
+@@ -58,6 +64,7 @@
+ 	int loadIPA();
+ 
+ 	void imguOutputBufferReady(FrameBuffer *buffer);
++	void temporalDenoise(const Stream *stream, FrameBuffer *buffer);
+ 	void cio2BufferReady(FrameBuffer *buffer);
+ 	void paramBufferReady(FrameBuffer *buffer);
+ 	void statBufferReady(FrameBuffer *buffer);
+@@ -72,6 +79,9 @@
+ 	Stream vfStream_;
+ 	Stream rawStream_;
+ 
++	/* Previous filtered frame of each output stream, for the software temporal denoiser. */
++	std::map<const Stream *, std::vector<uint8_t>> tnrPrev_;
++
+ 	Rectangle cropRegion_;
+ 
+ 	std::unique_ptr<DelayedControls> delayedCtrls_;
+@@ -772,6 +782,7 @@
+ 	int ret = 0;
+ 
+ 	data->cancelPendingRequests();
++	data->tnrPrev_.clear();
+ 
+ 	data->ipa_->stop();
+ 
+@@ -1261,6 +1272,81 @@
+  *
+  * Buffers completed from the ImgU output are directed to the application.
+  */
++/*
++ * Temporal noise reduction of the NV12 output, in software. The ImgU of the Surface Go has no usable temporal denoiser
++ * and the sensors are noisy in dim rooms: a still frame looks clean but the picture "crawls" in a live view (about
++ * +-1 level of noise per pixel, enough to be seen on a flat wall). Each pixel is blended with the filtered pixel of
++ * the previous frame, strongly when the change is small (noise) and not at all when it is large (motion, so no
++ * ghosting): out = prev + k(|d|) * d, k going from kTnrMinWeight at d = 0 to 1 at |d| >= kTnrThreshold.
++ * LIBCAMERA_IPU3_TNR="<min weight in 1/256> <threshold in levels>" overrides the values, "0 0" disables the filter.
++ */
++void IPU3CameraData::temporalDenoise(const Stream *stream, FrameBuffer *buffer)
++{
++	static const struct Params {
++		int minWeight = 48;
++		int threshold = 12;
++		Params()
++		{
++			const char *env = getenv("LIBCAMERA_IPU3_TNR");
++			if (env)
++				sscanf(env, "%d %d", &minWeight, &threshold);
++		}
++	} params;
++
++	if (params.threshold <= 0)
++		return;
++
++	const StreamConfiguration &cfg = stream->configuration();
++	if (cfg.pixelFormat != formats::NV12)
++		return;
++
++	MappedFrameBuffer mapped(buffer, MappedFrameBuffer::MapFlag::ReadWrite);
++	if (!mapped.isValid() || mapped.planes().size() < 2)
++		return;
++
++	const unsigned int width = cfg.size.width;
++	const unsigned int height = cfg.size.height;
++	const unsigned int stride = cfg.stride;
++	const size_t ySize = static_cast<size_t>(stride) * height;
++	const size_t uvSize = static_cast<size_t>(stride) * height / 2;
++	uint8_t *y = mapped.planes()[0].data();
++	uint8_t *uv = mapped.planes()[1].data();
++	if (mapped.planes()[0].size() < ySize || mapped.planes()[1].size() < uvSize)
++		return;
++
++	std::vector<uint8_t> &prev = tnrPrev_[stream];
++	if (prev.size() != ySize + uvSize) {
++		/* First frame (or a new configuration): nothing to blend with. */
++		prev.resize(ySize + uvSize);
++		std::copy(y, y + ySize, prev.begin());
++		std::copy(uv, uv + uvSize, prev.begin() + ySize);
++		return;
++	}
++
++	std::array<int, 256> weight;
++	for (int d = 0; d < 256; d++) {
++		const int w = d >= params.threshold ? 256
++			      : params.minWeight + (256 - params.minWeight) * d * d / (params.threshold * params.threshold);
++		weight[d] = w;
++	}
++
++	auto filter = [&](uint8_t *cur, uint8_t *old, unsigned int rows) {
++		for (unsigned int r = 0; r < rows; r++) {
++			uint8_t *c = cur + static_cast<size_t>(r) * stride;
++			uint8_t *o = old + static_cast<size_t>(r) * stride;
++			for (unsigned int x = 0; x < width; x++) {
++				const int d = c[x] - o[x];
++				const int ad = d < 0 ? -d : d;
++				const int v = o[x] + ((d * weight[ad] + (d < 0 ? -128 : 128)) / 256);
++				c[x] = o[x] = static_cast<uint8_t>(v);
++			}
++		}
++	};
++
++	filter(y, prev.data(), height);
++	filter(uv, prev.data() + ySize, height / 2);
++}
++
+ void IPU3CameraData::imguOutputBufferReady(FrameBuffer *buffer)
+ {
+ 	IPU3Frames::Info *info = frameInfos_.find(buffer);
+@@ -1269,6 +1355,13 @@
+ 
+ 	Request *request = info->request;
+ 
++	for (const auto &[stream, b] : request->buffers()) {
++		if (b == buffer) {
++			temporalDenoise(stream, buffer);
++			break;
++		}
++	}
++
+ 	pipe()->completeBuffer(request, buffer);
+ 
+ 	request->_d()->metadata().set(controls::draft::PipelineDepth, 3);

@@ -1,0 +1,12 @@
+[Unit]
+Description=NFC tag notifications (sound + desktop notification)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/nfc-notify
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

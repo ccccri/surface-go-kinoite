@@ -1,0 +1,70 @@
+--- a/drivers/media/i2c/ov8865.c
++++ b/drivers/media/i2c/ov8865.c
+@@ -1120,67 +1120,6 @@
+ 		.register_values_count	=
+ 			ARRAY_SIZE(ov8865_register_values_binning),
+ 	},
+-	/* 800x600 (SVGA) */
+-	{
+-		/* Horizontal */
+-		.output_size_x			= 800,
+-		.hts				= 1250,
+-
+-		/* Vertical */
+-		.output_size_y			= 600,
+-		.vts				= 640,
+-
+-		.size_auto			= true,
+-		.size_auto_boundary_x		= 8,
+-		.size_auto_boundary_y		= 8,
+-
+-		/* Subsample increase */
+-		.inc_x_odd			= 3,
+-		.inc_x_even			= 1,
+-		.inc_y_odd			= 5,
+-		.inc_y_even			= 3,
+-
+-		/* Binning */
+-		.binning_y			= true,
+-		.variopixel			= true,
+-		.variopixel_hsub_coef		= 2,
+-		.variopixel_vsub_coef		= 1,
+-		.sync_hbin			= true,
+-		.horz_var2			= true,
+-
+-		/* VFIFO */
+-		.vfifo_read_start		= 80,
+-
+-		.ablc_num			= 8,
+-		.zline_num			= 2,
+-
+-		/* Black Level */
+-
+-		.blc_top_zero_line_start	= 0,
+-		.blc_top_zero_line_num		= 2,
+-		.blc_top_black_line_start	= 2,
+-		.blc_top_black_line_num		= 2,
+-
+-		.blc_bottom_zero_line_start	= 0,
+-		.blc_bottom_zero_line_num	= 0,
+-		.blc_bottom_black_line_start	= 4,
+-		.blc_bottom_black_line_num	= 2,
+-
+-		.blc_col_shift_mask	= OV8865_BLC_CTRL1_COL_SHIFT_128,
+-
+-		.blc_anchor_left_start		= 288,
+-		.blc_anchor_left_end		= 415,
+-		.blc_anchor_right_start		= 992,
+-		.blc_anchor_right_end		= 1119,
+-
+-		/* PLL */
+-		.pll2_binning			= true,
+-
+-		/* Registers */
+-		.register_values	= ov8865_register_values_binning,
+-		.register_values_count	=
+-			ARRAY_SIZE(ov8865_register_values_binning),
+-	},
+ };
+ 
+ static const u32 ov8865_mbus_codes[] = {

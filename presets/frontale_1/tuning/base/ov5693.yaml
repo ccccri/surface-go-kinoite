@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: CC0-1.0
+# Surface Go IPU3 tuning (used for both the OV5693 front and OV8865 rear sensor).
+# Installed to /etc/libcamera/ipa/ipu3/<sensor>.yaml, which libcamera reads before /usr/share.
+#
+# The stock "uncalibrated.yaml" aims at a mean luminance of 0.16 and only forces the brightest 2% of the histogram
+# to 0.5, so in a backlit scene (window behind you) the exposure follows the window and everything else is black
+# (measured: 83% of pixels < 20/255). Here:
+#  - relativeLuminanceTarget 0.30: higher mean target (still moderate for evenly lit scenes)
+#  - lower constraint on the 25-55% quantile band >= 0.18: lifts shadows/midtones until they are visible, even if the
+#    window clips. Replaces the default "top 2% >= 0.5" constraint (only one lower bound per mode is allowed).
+# Measured on the same backlit scene: dark pixels 83% -> ~4%, median luma 0 -> ~120/255, colours stay neutral.
+# libcamera 0.7.x has no Ccm algorithm for the IPU3, so colour can only be balanced by Awb (grey world).
+version: 1
+algorithms:
+  - Af:
+  - Agc:
+      relativeLuminanceTarget: [ 0, 0.30 ]
+      AeConstraintMode:
+        ConstraintNormal:
+          lower:
+            qLo: 0.25
+            qHi: 0.55
+            yTarget: [ 0, 0.18 ]
+  - Awb:
+  - BlackLevelCorrection:
+  - ToneMapping:
+...

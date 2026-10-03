@@ -1,0 +1,37 @@
+--- a/drivers/media/i2c/ov8865.c
++++ b/drivers/media/i2c/ov8865.c
+@@ -1073,7 +1073,7 @@
+ 
+ 		/* Vertical */
+ 		.output_size_y			= 1224,
+-		.vts				= 1248,
++		.vts				= 4992,	/* 30 fps (was 1248 = 120 fps): the AE exposure limit follows vts */
+ 
+ 		.size_auto			= true,
+ 		.size_auto_boundary_x		= 8,
+@@ -1128,7 +1128,7 @@
+ 
+ 		/* Vertical */
+ 		.output_size_y			= 600,
+-		.vts				= 640,
++		.vts				= 7680,	/* 30 fps (was 640 = ~360 fps) */
+ 
+ 		.size_auto			= true,
+ 		.size_auto_boundary_x		= 8,
+@@ -2770,6 +2770,16 @@
+ 				 OV8865_TIMING_MAX_VTS - mode->output_size_y,
+ 				 1, mode->vts - mode->output_size_y);
+ 
++	/*
++	 * modify_range() only changes the default: the current VBLANK value would stay whatever it was (22, the
++	 * default of the first mode), i.e. 120 fps and an exposure limit of ~8 ms in the 1632x1224 mode, while the
++	 * exposure range below is computed from mode->vts. Apply the mode's default so that frame rate and
++	 * exposure limits are consistent (libcamera's IPU3 pipeline never sets VBLANK itself).
++	 */
++	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE)
++		__v4l2_ctrl_s_ctrl(sensor->ctrls.vblank,
++				   mode->vts - mode->output_size_y);
++
+ 	hblank = mode->hts - mode->output_size_x;
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.hblank, hblank, hblank, 1,
+ 				 hblank);

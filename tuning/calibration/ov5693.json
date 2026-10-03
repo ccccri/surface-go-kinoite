@@ -1,0 +1,57 @@
+{
+ "comment": "Extra gain of the red, blue and overall (g) channels vs the distance from the optical centre (BDS-normalised radius 0, 0.2 ... 1.4), measured in situ with the front lens against a white PC monitor window (closed loop after the black level fix: R/G, B/G and G flat within 2-3%; g smoothed); applied on top of the Windows lens shading tables. The g profile is capped at 1.4 (calibrated 1.75): more gain at the corners made the colour noise there too visible.",
+ "sensor": "ov5693 front YHCU",
+ "r": [
+  1.0,
+  0.9915,
+  1.0052,
+  1.0393,
+  1.0805,
+  1.1918,
+  1.2279,
+  1.2279
+ ],
+ "b": [
+  1.0,
+  0.9936,
+  0.9945,
+  0.9815,
+  0.9709,
+  0.9691,
+  0.9672,
+  0.9672
+ ],
+ "g": [
+  1.0,
+  1.03,
+  1.08,
+  1.16,
+  1.24,
+  1.32,
+  1.4,
+  1.4
+ ],
+ "black": [
+  9,
+  18,
+  9,
+  9
+ ],
+ "black_comment": "Black level subtracted by the ImgU for Gr, R, B, Gb (10 bit): measured with the lens covered at fixed analogue gain 1 and 4 (output starts to lift below these values); libcamera used 64, which crushed the shadows.",
+ "tone": {
+  "gamma": 1.5,
+  "agc_target": 0.22,
+  "agc_lower": 0.1,
+  "comment": "libcamera's fixed ToneMapping gamma 1.1 is almost linear: dark objects are crushed. Gamma 1.5 (patch ipu3-tonemapping) with the AE targets lowered to match (measured on a scene with black backpacks: 20% of pixels < 20/255 -> 1.4%, no clipping).",
+  "contrast": 0.3
+ },
+ "bnr": [
+  1700,
+  24,
+  4,
+  8,
+  8,
+  10
+ ],
+ "bnr_comment": "Bayer noise reduction [cf, cg, alpha, beta, gamma, max_inf]: cf is the constant noise threshold, cg>0 makes the filter stronger as the gain rises, alpha/beta/gamma weigh the smoothing filter (Intel defaults: 1700, 0, 9, 3, 4, 8)."
+}
