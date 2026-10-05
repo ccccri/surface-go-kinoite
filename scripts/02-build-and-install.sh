@@ -190,11 +190,13 @@ else
     curl -fsSL "https://github.com/libcamera-org/libcamera/archive/refs/tags/v$LCV.tar.gz" | tar xz -C "$LCROOT"
     LCOK=1
     [ -e "${LCPATCHES[0]}" ] || LCOK=0
-    for P in "${LCPATCHES[@]}"; do
-        (cd "$LCROOT/libcamera-$LCV" && git apply --check -p1 "$P") 2>/dev/null || LCOK=0
-    done
+    # applied in file-name order, one after the other: later patches build on earlier ones, so each cannot be checked alone against the pristine tree
     if [ $LCOK = 1 ]; then
-        for P in "${LCPATCHES[@]}"; do (cd "$LCROOT/libcamera-$LCV" && git apply -p1 "$P"); done
+        for P in "${LCPATCHES[@]}"; do
+            (cd "$LCROOT/libcamera-$LCV" && git apply -p1 "$P") || { echo "libcamera patch failed: $(basename "$P")"; LCOK=0; break; }
+        done
+    fi
+    if [ $LCOK = 1 ]; then
         toolbox run -c "$TB" sudo dnf install -y meson ninja-build python3-yaml python3-jinja2 python3-ply \
             libyaml-devel systemd-devel openssl-devel gcc-c++ pkgconf-pkg-config
         toolbox run -c "$TB" bash -c "cd '$LCROOT/libcamera-$LCV' \
