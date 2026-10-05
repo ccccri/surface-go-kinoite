@@ -20,6 +20,7 @@ FAKE = bool(os.environ.get("SURFACE_INSTALLER_FAKE"))
 MOK_PASSWORD = "surface"
 AUTOSTART = os.path.expanduser("~/.config/autostart/surface-installer.desktop")
 KMODS = "/var/lib/local-kmods"
+LOGFILE = os.path.expanduser("~/.local/state/surface-installer/install.log")      # everything the steps print, to read with tail -f or to attach to a bug report
 
 
 def run(cmd, timeout=15):
@@ -213,9 +214,21 @@ class Bridge(QObject):
         else:
             p.start("setsid", ["-w", "bash", os.path.join(GUIDE, "scripts", script)])
         self.logLine.emit("$ %s\n" % script)
+        self._log("\n$ %s\n" % script)
+
+    def _log(self, text):
+        if FAKE:
+            return
+        try:
+            os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+            with open(LOGFILE, "a") as f:
+                f.write(text)
+        except OSError:
+            pass
 
     def _read(self):
         data = bytes(self._proc.readAllStandardOutput()).decode("utf-8", "replace")
+        self._log(data)
         self.logLine.emit(data)
         self._buf += data
         *lines, self._buf = self._buf.split("\n")
@@ -245,6 +258,7 @@ class Bridge(QObject):
         self.busyChanged.emit()
         self.stepChanged.emit()
         if code != 0:
+            self._log("\n[installer] step failed with code %d\n" % code)
             self.failed.emit("The step stopped with an error (code %d). Open the details below to see why; fix it and press Try again." % code)
             return
         if self._then:
