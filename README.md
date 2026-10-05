@@ -53,6 +53,8 @@ A newer libcamera lists `Ccm` in its IPU3 tuning file; when Fedora ships it, a m
 
 ## Quick path on a clean install
 
+**Before wiping a tablet that already works, copy `~/mok` somewhere safe.** Put it back in the same place after reinstalling: the key is already trusted by the firmware, so the blue MOK screen is not needed again.
+
 **Easiest: the installer window.** In a terminal on the Surface:
 
 ```bash
@@ -60,7 +62,7 @@ git clone https://github.com/ccccri/surface-go-kinoite.git ~/surface-go-kinoite
 ~/surface-go-kinoite/install.sh
 ```
 
-A wizard (PySide6, already on Kinoite) checks the device, asks for your password once, runs the steps below with a progress bar, tells you what to press on the blue
+On a brand new Kinoite install PySide6 is missing until the first system update, so the first run does step 1 in the terminal (update + key); restart, press the keys on the blue MOK screen, run `install.sh` again and the window opens. The wizard checks the device, asks for your password once, runs the steps below with a progress bar, tells you what to press on the blue
 MOK screen, reopens by itself after each restart and ends with the verification. "Show details" opens the console output for power users. It looks at the
 system to know where it is, so closing it is safe. The steps below are what it runs; you can still do them by hand.
 
