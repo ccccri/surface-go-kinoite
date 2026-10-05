@@ -179,9 +179,11 @@ class Bridge(QObject):
 
     # ---------------------------------------------------------------- running a step
     def _write_autostart(self):
+        if FAKE:
+            return                                  # tests must never leave an autostart entry behind
         os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
         with open(AUTOSTART, "w") as f:
-            f.write("[Desktop Entry]\nType=Application\nName=Surface Go installer\nExec=python3 %s\nIcon=system-software-install\nX-KDE-autostart-after=panel\n"
+            f.write("[Desktop Entry]\nType=Application\nName=Surface Go installer\nExec=python3 %s --resume\nIcon=system-software-install\nX-KDE-autostart-after=panel\n"
                     % shlex.quote(os.path.join(HERE, "installer.py")))
 
     def _run(self, script, next_stage, total, extra_env, then=None, parse=False):
@@ -254,6 +256,12 @@ class Bridge(QObject):
 
 
 def main():
+    if "--resume" in sys.argv and stage() == "welcome":      # started at login but nothing to continue: remove the entry and stay away
+        try:
+            os.remove(AUTOSTART)
+        except OSError:
+            pass
+        return
     app = QGuiApplication(sys.argv)
     app.setApplicationName("Surface Go installer")
     app.setDesktopFileName("surface-installer")
