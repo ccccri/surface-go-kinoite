@@ -3,6 +3,7 @@
 
 The state is never stored: every time the window opens it looks at the system (MOK key, build marker for the running kernel) and goes to the right page, so it
 also works after the restart that the Secure Boot step needs. Environment variables for testing: SURFACE_INSTALLER_FAKE=1 runs fake steps."""
+import glob
 import os
 import re
 import shlex
@@ -60,8 +61,8 @@ def stage():
         if os.path.exists("%s/built-%s" % (KMODS, os.uname().release)):
             return "verify"
         return "install"
-    rc, new = run(["mokutil", "--list-new"])
-    if os.path.exists(der) and "Surface Go local module signing" in new:
+    # a queued enrolment is a "MokNew" variable (mokutil --list-new needs root, the variable can be listed by anyone)
+    if os.path.exists(der) and glob.glob("/sys/firmware/efi/efivars/MokNew-*"):
         return "restart-mok"
     return "welcome"
 
