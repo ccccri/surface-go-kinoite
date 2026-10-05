@@ -19,6 +19,15 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name, extra, flush=True)
 
 
+enabled_here = False
+if not eq.available():              # a fresh install has the chain switched off: switch it on for the test and off again at the end
+    eq.enable()
+    time.sleep(4)
+    enabled_here = True
+if not backend.audio_info()["mic"].get("available"):
+    backend.enable_mic_enhancer()
+    time.sleep(4)
+    enabled_here = True
 check("equaliser chain present", eq.available())
 orig = eq.load()
 try:

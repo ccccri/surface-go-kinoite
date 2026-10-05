@@ -7,6 +7,7 @@ import subprocess
 import time
 
 d = os.path.expanduser("~/.config/surface-suite/camera")
+os.makedirs(d, exist_ok=True)      # a freshly installed system has no profile folder yet
 fp = d + "/ov5693.profile"
 saved = {}
 for n in os.listdir(d) if os.path.isdir(d) else []:
