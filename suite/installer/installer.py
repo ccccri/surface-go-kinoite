@@ -54,13 +54,14 @@ def stage():
     """Where the installation is, from the system itself."""
     if FAKE:
         return os.environ.get("SURFACE_INSTALLER_STAGE", "welcome")
-    rc, enrolled = run(["mokutil", "--list-enrolled"])
-    if "Surface Go local module signing" in enrolled:
+    der = os.path.join(os.environ.get("MOKDIR", os.path.expanduser("~/mok")), "MOK.der")
+    rc, test = run(["mokutil", "--test-key", der]) if os.path.exists(der) else (1, "")
+    if "is already enrolled" in test:
         if os.path.exists("%s/built-%s" % (KMODS, os.uname().release)):
             return "verify"
         return "install"
     rc, new = run(["mokutil", "--list-new"])
-    if "Surface Go local module signing" in new:
+    if os.path.exists(der) and "Surface Go local module signing" in new:
         return "restart-mok"
     return "welcome"
 
@@ -201,6 +202,7 @@ class Bridge(QObject):
             env.insert(k, v)
         # no terminal for sudo: it asks the helper, which prints the password the window already collected
         env.insert("SUDO_ASKPASS", os.path.join(HERE, "askpass.sh"))
+        env.insert("PATH", os.path.join(HERE, "bin") + ":" + env.value("PATH"))      # bin/sudo = sudo -A, so the scripts need no change
         env.insert("SURFACE_INSTALLER_PW", self._pw)
         p.setProcessEnvironment(env)
         p.setProcessChannelMode(QProcess.MergedChannels)

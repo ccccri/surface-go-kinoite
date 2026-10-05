@@ -30,9 +30,9 @@ say() { printf '\n== %s\n' "$*"; }
 
 [ -f "$MOKDIR/MOK.priv" ] && [ -f "$MOKDIR/MOK.der" ] || { echo "No MOK key in $MOKDIR: run 01-upgrade-and-mok.sh first"; exit 1; }
 # capture first: "mokutil | grep -q" under pipefail fails with SIGPIPE when grep exits early
-ENROLLED=$(mokutil --list-enrolled 2>/dev/null || true)
-grep -q "Surface Go local module signing" <<<"$ENROLLED" \
-    || { echo "The MOK key is not enrolled yet (blue screen at boot). Aborting."; exit 1; }
+TEST=$(mokutil --test-key "$MOKDIR/MOK.der" 2>&1 || true)
+grep -q "is already enrolled" <<<"$TEST" \
+    || { echo "The MOK key in $MOKDIR is not enrolled yet (blue screen at boot; after a reinstall run 01-upgrade-and-mok.sh again). Aborting."; exit 1; }
 
 say "Build container ($TB) and kernel headers for $K"
 toolbox list --containers 2>/dev/null | grep -qw "$TB" || toolbox create -y "$TB"

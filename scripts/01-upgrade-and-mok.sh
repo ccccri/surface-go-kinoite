@@ -24,8 +24,9 @@ if [ ! -f MOK.priv ]; then
     chmod 600 MOK.priv
 fi
 
-ENROLLED=$(mokutil --list-enrolled 2>/dev/null || true)   # not piped: grep -q + pipefail = SIGPIPE
-if grep -q "Surface Go local module signing" <<<"$ENROLLED"; then
+# Ask about THIS key, not about its name: after a reinstall the firmware still holds the old key with the same name, and the new one is not enrolled.
+TEST=$(mokutil --test-key "$MOKDIR/MOK.der" 2>&1 || true)
+if grep -q "is already enrolled" <<<"$TEST"; then
     echo "MOK key already enrolled, nothing to queue."
 else
     mokutil --generate-hash="$MOK_PASSWORD" > hash.txt

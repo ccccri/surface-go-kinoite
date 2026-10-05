@@ -1,0 +1,3 @@
+#!/bin/sh
+# Used only by the installer window: the scripts call plain "sudo", which never uses the askpass helper without -A and cannot ask on a terminal that does not exist.
+exec /usr/bin/sudo -A "$@"
